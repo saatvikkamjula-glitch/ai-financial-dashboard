@@ -1,430 +1,1234 @@
-import yfinance as yf
-import pandas as pd
-import plotly.express as px
-import requests
+import math
+import platform
+import re
+import subprocess
+import webbrowser
 from datetime import datetime
+from html import escape
 from pathlib import Path
 
-watchlist = ["NVDA", "AAPL", "MSFT", "SPY", "QQQ", "BTC-USD"]
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import yfinance as yf
 
-reports_folder = Path("reports")
-reports_folder.mkdir(exist_ok=True)
+
+# ============================================================
+# FILE SETTINGS
+# ============================================================
+
+PORTFOLIO_FILE = Path("portfolio.csv")
+REPORTS_FOLDER = Path("reports")
+REPORT_FILE = REPORTS_FOLDER / "financial_dashboard.html"
 
 
-def clean_value(value):
-    if value is None or value == "N/A" or value == "":
-        return "Not Applicable"
-    return value
+# ============================================================
+# PORTFOLIO INPUT
+# ============================================================
+
+def ask_yes_no(question):
+    while True:
+        answer = input(question + " (y/n): ").strip().lower()
+
+        if answer in ["y", "yes"]:
+            return True
+
+        if answer in ["n", "no"]:
+            return False
+
+        print("Please type y or n.")
+
+
+def create_portfolio_from_terminal():
+    print("\nEnter your portfolio.")
+    print("Example tickers: AAPL, MSFT, NVDA, TSLA, SPY")
+    print("When you are done, press Enter without typing a ticker.\n")
+
+    holdings = []
+
+    while True:
+        ticker = input("Stock ticker: ").strip().upper()
+
+        if ticker == "":
+            break
+
+        try:
+            shares = float(input(f"How many shares of {ticker} do you own? ").strip())
+            average_cost = float(input(f"What is your average cost per share for {ticker}? ").strip())
+        except ValueError:
+            print("Invalid number. Try that stock again.\n")
+            continue
+
+        if shares <= 0:
+            print("Shares must be greater than 0.\n")
+            continue
+
+        holdings.append({
+            "Ticker": ticker,
+            "Shares": shares,
+            "Average Cost": average_cost,
+        })
+
+        print(f"Added {ticker}.\n")
+
+    if not holdings:
+        print("No holdings entered. Creating sample portfolio instead.")
+
+        holdings = [
+            {"Ticker": "AAPL", "Shares": 2, "Average Cost": 180},
+            {"Ticker": "MSFT", "Shares": 1, "Average Cost": 400},
+            {"Ticker": "NVDA", "Shares": 1, "Average Cost": 900},
+            {"Ticker": "TSLA", "Shares": 1, "Average Cost": 250},
+            {"Ticker": "SPY", "Shares": 1, "Average Cost": 500},
+        ]
+
+    df = pd.DataFrame(holdings)
+    df.to_csv(PORTFOLIO_FILE, index=False)
+
+    print(f"\nSaved portfolio to {PORTFOLIO_FILE}.\n")
+
+    return df
+
+
+def load_portfolio():
+    if PORTFOLIO_FILE.exists():
+        use_existing = ask_yes_no("Do you want to use your existing portfolio.csv?")
+
+        if use_existing:
+            df = pd.read_csv(PORTFOLIO_FILE)
+        else:
+            df = create_portfolio_from_terminal()
+    else:
+        print("portfolio.csv was not found.")
+        df = create_portfolio_from_terminal()
+
+    required_columns = {"Ticker", "Shares", "Average Cost"}
+
+    if not required_columns.issubset(df.columns):
+        raise ValueError("portfolio.csv must have these columns: Ticker, Shares, Average Cost")
+
+    df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
+    df["Shares"] = pd.to_numeric(df["Shares"], errors="coerce").fillna(0)
+    df["Average Cost"] = pd.to_numeric(df["Average Cost"], errors="coerce").fillna(0)
+
+    df = df[df["Ticker"] != ""]
+    df = df[df["Shares"] > 0]
+
+    if df.empty:
+        raise ValueError("No valid portfolio holdings found.")
+
+    return df
+
+
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+
+def send_mac_notification(title, message):
+    if platform.system() == "Darwin":
+        try:
+            subprocess.run([
+                "osascript",
+                "-e",
+                f'display notification "{message}" with title "{title}"'
+            ])
+        except Exception:
+            print(f"{title}: {message}")
+    else:
+        print(f"{title}: {message}")
 
 
 def clean_ai_text(text):
+    """
+    Cleans Ollama output so the dashboard does not show weird symbols like:
+    [2D, [K, escape codes, asterisks, markdown marks, or broken formatting.
+    """
+    if not text:
+        return ""
+
+    # Remove ANSI escape codes like ESC[2D, ESC[K, etc.
+    ansi_escape_pattern = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+    text = ansi_escape_pattern.sub("", text)
+
+    # Remove leftover broken escape-looking text
+    text = re.sub(r"\[[0-9;?]*[A-Za-z]", "", text)
+
+    # Remove common markdown symbols
     text = text.replace("*", "")
-    text = text.replace("###", "")
-    text = text.replace("##", "")
     text = text.replace("#", "")
+    text = text.replace("`", "")
+
+    # Clean extra spaces
+    text = re.sub(r"[ \t]+", " ", text)
+
+    # Clean extra blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
     return text.strip()
 
 
-def ask_ollama(prompt):
-    url = "http://localhost:11434/api/generate"
+def format_ai_summary_as_html(text):
+    """
+    Converts the cleaned AI summary into readable HTML with bullet points.
+    """
+    text = clean_ai_text(text)
 
-    payload = {
-        "model": "llama3.2:3b",
-        "prompt": prompt,
-        "stream": False
-    }
+    if not text:
+        return "<p>No AI summary was generated.</p>"
 
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    html_parts = []
+    bullet_items = []
+
+    for line in lines:
+        clean_line = line.strip()
+
+        if not clean_line:
+            continue
+
+        # Remove existing bullet symbols and numbers
+        clean_line = re.sub(r"^[-•]\s*", "", clean_line)
+        clean_line = re.sub(r"^\d+\.\s*", "", clean_line)
+
+        # If it looks like a heading, make it a small heading
+        lower_line = clean_line.lower()
+        is_heading = (
+            lower_line in [
+                "today's summary",
+                "portfolio summary",
+                "key takeaways",
+                "what happened today",
+                "things to watch",
+                "important things to watch"
+            ]
+            or clean_line.endswith(":")
+        )
+
+        if is_heading:
+            if bullet_items:
+                html_parts.append("<ul>" + "".join(bullet_items) + "</ul>")
+                bullet_items = []
+
+            html_parts.append(f"<h3>{escape(clean_line.rstrip(':'))}</h3>")
+        else:
+            bullet_items.append(f"<li>{escape(clean_line)}</li>")
+
+    if bullet_items:
+        html_parts.append("<ul>" + "".join(bullet_items) + "</ul>")
+
+    return "\n".join(html_parts)
+
+
+def safe_float(value):
     try:
-        response = requests.post(url, json=payload)
-        response.raise_for_status()
-        return clean_ai_text(response.json()["response"])
-    except Exception as error:
-        return f"AI summary could not be generated. Error: {error}"
+        if value is None:
+            return None
 
+        value = float(value)
 
-rows = []
-news_rows = []
+        if math.isnan(value):
+            return None
 
-for ticker in watchlist:
-    stock = yf.Ticker(ticker)
-    data = stock.history(period="5d")
-    info = stock.info
-
-    current_price = data["Close"].iloc[-1]
-    previous_price = data["Close"].iloc[-2]
-
-    daily_change = current_price - previous_price
-    daily_change_pct = (daily_change / previous_price) * 100
-
-    market_cap = info.get("marketCap")
-    pe_ratio = info.get("trailingPE")
-    sector = info.get("sector")
-    industry = info.get("industry")
-    company_name = info.get("longName")
-
-    rows.append({
-        "Ticker": ticker,
-        "Company Name": clean_value(company_name),
-        "Current Price": round(current_price, 2),
-        "Daily Change $": round(daily_change, 2),
-        "Daily Change %": round(daily_change_pct, 2),
-        "Market Cap": clean_value(market_cap),
-        "P/E Ratio": clean_value(pe_ratio),
-        "Sector": clean_value(sector),
-        "Industry": clean_value(industry)
-    })
-
-    try:
-        news = stock.news[:3]
-
-        if len(news) == 0:
-            news_rows.append({
-                "Ticker": ticker,
-                "Headline": "No recent headlines found",
-                "Publisher": "Not Applicable",
-                "Link": "Not Applicable"
-            })
-
-        for article in news:
-            news_rows.append({
-                "Ticker": ticker,
-                "Headline": clean_value(article.get("title")),
-                "Publisher": clean_value(article.get("publisher")),
-                "Link": clean_value(article.get("link"))
-            })
-
+        return value
     except Exception:
-        news_rows.append({
+        return None
+
+
+def format_money(value):
+    if value is None or pd.isna(value):
+        return "N/A"
+
+    return f"${value:,.2f}"
+
+
+def format_percent(value):
+    if value is None or pd.isna(value):
+        return "N/A"
+
+    return f"{value:.2f}%"
+
+
+def get_positive_negative_class(value):
+    if value is None or pd.isna(value):
+        return ""
+
+    return "positive" if value >= 0 else "negative"
+
+
+def get_sign(value):
+    if value is None or pd.isna(value):
+        return ""
+
+    return "+" if value >= 0 else ""
+
+
+def get_company_name(ticker):
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+
+        return info.get("shortName") or info.get("longName") or ticker
+    except Exception:
+        return ticker
+
+
+def get_fast_info_value(stock, key):
+    try:
+        value = stock.fast_info.get(key)
+        return safe_float(value)
+    except Exception:
+        return None
+
+
+def calculate_rsi(prices, period=14):
+    delta = prices.diff()
+
+    gains = delta.where(delta > 0, 0)
+    losses = -delta.where(delta < 0, 0)
+
+    avg_gain = gains.rolling(window=period).mean()
+    avg_loss = losses.rolling(window=period).mean()
+
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+
+    if rsi.dropna().empty:
+        return None
+
+    return safe_float(rsi.iloc[-1])
+
+
+def calculate_period_return(history, days):
+    if len(history) <= days:
+        return None
+
+    current = history["Close"].iloc[-1]
+    past = history["Close"].iloc[-days]
+
+    if past == 0:
+        return None
+
+    return safe_float(((current - past) / past) * 100)
+
+
+def get_rsi_signal(rsi):
+    if rsi is None:
+        return "Not enough data"
+
+    if rsi >= 70:
+        return "Overbought"
+
+    if rsi <= 30:
+        return "Oversold"
+
+    return "Neutral"
+
+
+def get_trend_signal(current_price, sma_20, sma_50):
+    if sma_20 is None or sma_50 is None:
+        return "Not enough data"
+
+    if current_price > sma_20 and sma_20 > sma_50:
+        return "Bullish trend"
+
+    if current_price < sma_20 and sma_20 < sma_50:
+        return "Bearish trend"
+
+    return "Mixed trend"
+
+
+# ============================================================
+# STOCK DATA
+# ============================================================
+
+def get_stock_data(ticker):
+    try:
+        stock = yf.Ticker(ticker)
+
+        history = stock.history(period="6mo", interval="1d")
+
+        if history.empty or len(history) < 2:
+            return None
+
+        history = history.dropna()
+
+        latest_close = safe_float(history["Close"].iloc[-1])
+        previous_close = safe_float(history["Close"].iloc[-2])
+
+        last_price = get_fast_info_value(stock, "last_price")
+        previous_close_fast = get_fast_info_value(stock, "previous_close")
+        year_high = get_fast_info_value(stock, "year_high")
+        year_low = get_fast_info_value(stock, "year_low")
+        market_cap = get_fast_info_value(stock, "market_cap")
+
+        current_price = last_price if last_price is not None else latest_close
+        previous_price = previous_close_fast if previous_close_fast is not None else previous_close
+
+        daily_change = current_price - previous_price
+        daily_change_percent = (daily_change / previous_price) * 100 if previous_price else 0
+
+        sma_20 = safe_float(history["Close"].rolling(window=20).mean().iloc[-1]) if len(history) >= 20 else None
+        sma_50 = safe_float(history["Close"].rolling(window=50).mean().iloc[-1]) if len(history) >= 50 else None
+
+        rsi = calculate_rsi(history["Close"])
+
+        daily_returns = history["Close"].pct_change().dropna()
+        annualized_volatility = safe_float(daily_returns.std() * math.sqrt(252) * 100) if not daily_returns.empty else None
+
+        five_day_return = calculate_period_return(history, 5)
+        one_month_return = calculate_period_return(history, 21)
+        three_month_return = calculate_period_return(history, 63)
+
+        distance_from_52w_high = None
+
+        if year_high is not None and year_high != 0:
+            distance_from_52w_high = ((current_price - year_high) / year_high) * 100
+
+        return {
+            "ticker": ticker,
+            "company_name": get_company_name(ticker),
+            "history": history,
+            "current_price": current_price,
+            "previous_price": previous_price,
+            "daily_change": daily_change,
+            "daily_change_percent": daily_change_percent,
+            "sma_20": sma_20,
+            "sma_50": sma_50,
+            "rsi": rsi,
+            "rsi_signal": get_rsi_signal(rsi),
+            "trend_signal": get_trend_signal(current_price, sma_20, sma_50),
+            "annualized_volatility": annualized_volatility,
+            "five_day_return": five_day_return,
+            "one_month_return": one_month_return,
+            "three_month_return": three_month_return,
+            "year_high": year_high,
+            "year_low": year_low,
+            "distance_from_52w_high": distance_from_52w_high,
+            "market_cap": market_cap,
+        }
+
+    except Exception as error:
+        print(f"Error getting data for {ticker}: {error}")
+        return None
+
+
+def build_portfolio_dataframe(portfolio_input):
+    rows = []
+
+    for _, holding in portfolio_input.iterrows():
+        ticker = holding["Ticker"]
+        shares = float(holding["Shares"])
+        average_cost = float(holding["Average Cost"])
+
+        data = get_stock_data(ticker)
+
+        if data is None:
+            print(f"Could not get data for {ticker}")
+            continue
+
+        current_value = data["current_price"] * shares
+        previous_value = data["previous_price"] * shares
+        daily_gain_loss = current_value - previous_value
+
+        cost_basis = average_cost * shares
+        total_gain_loss = current_value - cost_basis if average_cost > 0 else None
+        total_gain_loss_percent = (total_gain_loss / cost_basis) * 100 if cost_basis > 0 else None
+
+        rows.append({
             "Ticker": ticker,
-            "Headline": "No recent headlines found",
-            "Publisher": "Not Applicable",
-            "Link": "Not Applicable"
+            "Company": data["company_name"],
+            "Shares": shares,
+            "Average Cost": average_cost,
+            "Current Price": round(data["current_price"], 2),
+            "Previous Price": round(data["previous_price"], 2),
+            "Daily Change": round(data["daily_change"], 2),
+            "Daily Change %": round(data["daily_change_percent"], 2),
+            "Current Value": round(current_value, 2),
+            "Previous Value": round(previous_value, 2),
+            "Daily Gain/Loss": round(daily_gain_loss, 2),
+            "Cost Basis": round(cost_basis, 2),
+            "Total Gain/Loss": round(total_gain_loss, 2) if total_gain_loss is not None else None,
+            "Total Gain/Loss %": round(total_gain_loss_percent, 2) if total_gain_loss_percent is not None else None,
+            "5D Return %": round(data["five_day_return"], 2) if data["five_day_return"] is not None else None,
+            "1M Return %": round(data["one_month_return"], 2) if data["one_month_return"] is not None else None,
+            "3M Return %": round(data["three_month_return"], 2) if data["three_month_return"] is not None else None,
+            "20D SMA": round(data["sma_20"], 2) if data["sma_20"] is not None else None,
+            "50D SMA": round(data["sma_50"], 2) if data["sma_50"] is not None else None,
+            "RSI": round(data["rsi"], 2) if data["rsi"] is not None else None,
+            "RSI Signal": data["rsi_signal"],
+            "Trend Signal": data["trend_signal"],
+            "Annualized Volatility %": round(data["annualized_volatility"], 2) if data["annualized_volatility"] is not None else None,
+            "52W High": round(data["year_high"], 2) if data["year_high"] is not None else None,
+            "52W Low": round(data["year_low"], 2) if data["year_low"] is not None else None,
+            "Distance From 52W High %": round(data["distance_from_52w_high"], 2) if data["distance_from_52w_high"] is not None else None,
+            "Market Cap": data["market_cap"],
         })
 
+    df = pd.DataFrame(rows)
 
-df = pd.DataFrame(rows)
-news_df = pd.DataFrame(news_rows)
+    if df.empty:
+        return df
 
-today = datetime.now().strftime("%Y-%m-%d")
+    total_value = df["Current Value"].sum()
+    df["Portfolio Weight %"] = (df["Current Value"] / total_value * 100).round(2)
 
-csv_file = reports_folder / f"daily_report_{today}.csv"
-news_csv_file = reports_folder / f"news_report_{today}.csv"
+    return df
 
-df.to_csv(csv_file, index=False)
-news_df.to_csv(news_csv_file, index=False)
 
-best_stock = df.loc[df["Daily Change %"].idxmax()]
-worst_stock = df.loc[df["Daily Change %"].idxmin()]
-average_change = round(df["Daily Change %"].mean(), 2)
+# ============================================================
+# CHARTS
+# ============================================================
 
-market_data_text = df.to_string(index=False)
-news_text = news_df.to_string(index=False)
+def create_portfolio_value_chart(df):
+    fig = px.bar(
+        df,
+        x="Ticker",
+        y="Current Value",
+        title="Portfolio Value by Stock",
+        text="Current Value",
+        color="Ticker"
+    )
 
-ai_prompt = f"""
-You are helping build a financial research dashboard.
+    fig.update_traces(texttemplate="$%{text:.2f}", textposition="outside")
 
-Analyze this watchlist data and headlines.
+    fig.update_layout(
+        xaxis_title="Stock",
+        yaxis_title="Current Value",
+        template="plotly_white",
+        showlegend=False
+    )
 
-Important rules:
-- Do not use markdown formatting.
-- Do not use asterisks.
-- Do NOT give direct buy or sell advice.
-- Do NOT pretend you know the exact reason a stock moved unless the data clearly supports it.
-- Give possible reasons investors should research further.
-- Be detailed and practical.
-- Focus on company news, sector trends, valuation, earnings expectations, interest rates, AI demand, macro conditions, and risk factors.
-- Explain what the best and worst performers might mean.
-- Include research questions someone could investigate next.
+    return fig.to_html(full_html=False, include_plotlyjs="cdn")
 
-Market data:
-{market_data_text}
 
-Headlines:
-{news_text}
+def create_daily_gain_loss_chart(df):
+    colors = ["green" if value >= 0 else "red" for value in df["Daily Gain/Loss"]]
 
-Write a detailed market research summary with these sections:
-1. Overall Market Takeaway
-2. Best Performer Analysis
-3. Worst Performer Analysis
-4. Key Themes To Research
-5. Risk Factors
-6. Questions For Further Research
+    fig = go.Figure()
+
+    fig.add_trace(go.Bar(
+        x=df["Ticker"],
+        y=df["Daily Gain/Loss"],
+        text=[f"${value:.2f}" for value in df["Daily Gain/Loss"]],
+        textposition="outside",
+        marker_color=colors
+    ))
+
+    fig.update_layout(
+        title="Daily Gain/Loss by Stock",
+        xaxis_title="Stock",
+        yaxis_title="Gain/Loss",
+        template="plotly_white"
+    )
+
+    return fig.to_html(full_html=False, include_plotlyjs=False)
+
+
+def create_total_gain_loss_chart(df):
+    colors = ["green" if value >= 0 else "red" for value in df["Total Gain/Loss"]]
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Bar(
+        x=df["Ticker"],
+        y=df["Total Gain/Loss"],
+        text=[f"${value:.2f}" for value in df["Total Gain/Loss"]],
+        textposition="outside",
+        marker_color=colors
+    ))
+
+    fig.update_layout(
+        title="Total Gain/Loss Compared to Average Cost",
+        xaxis_title="Stock",
+        yaxis_title="Total Gain/Loss",
+        template="plotly_white"
+    )
+
+    return fig.to_html(full_html=False, include_plotlyjs=False)
+
+
+def create_allocation_chart(df):
+    fig = px.pie(
+        df,
+        names="Ticker",
+        values="Current Value",
+        title="Portfolio Allocation"
+    )
+
+    fig.update_traces(textposition="inside", textinfo="percent+label")
+
+    fig.update_layout(template="plotly_white")
+
+    return fig.to_html(full_html=False, include_plotlyjs=False)
+
+
+def create_normalized_performance_chart(tickers):
+    fig = go.Figure()
+
+    for ticker in tickers:
+        data = get_stock_data(ticker)
+
+        if data is None:
+            continue
+
+        history = data["history"]
+        normalized = history["Close"] / history["Close"].iloc[0] * 100
+
+        fig.add_trace(go.Scatter(
+            x=history.index,
+            y=normalized,
+            mode="lines",
+            name=ticker
+        ))
+
+    fig.update_layout(
+        title="6-Month Normalized Performance",
+        xaxis_title="Date",
+        yaxis_title="Starting at 100",
+        template="plotly_white"
+    )
+
+    return fig.to_html(full_html=False, include_plotlyjs=False)
+
+
+def create_moving_average_chart(tickers):
+    fig = go.Figure()
+
+    for ticker in tickers:
+        data = get_stock_data(ticker)
+
+        if data is None:
+            continue
+
+        history = data["history"].copy()
+        history["SMA 20"] = history["Close"].rolling(window=20).mean()
+        history["SMA 50"] = history["Close"].rolling(window=50).mean()
+
+        fig.add_trace(go.Scatter(
+            x=history.index,
+            y=history["Close"],
+            mode="lines",
+            name=f"{ticker} Price"
+        ))
+
+        fig.add_trace(go.Scatter(
+            x=history.index,
+            y=history["SMA 20"],
+            mode="lines",
+            name=f"{ticker} 20D SMA",
+            line=dict(dash="dash")
+        ))
+
+        fig.add_trace(go.Scatter(
+            x=history.index,
+            y=history["SMA 50"],
+            mode="lines",
+            name=f"{ticker} 50D SMA",
+            line=dict(dash="dot")
+        ))
+
+    fig.update_layout(
+        title="Price With Moving Averages",
+        xaxis_title="Date",
+        yaxis_title="Price",
+        template="plotly_white"
+    )
+
+    return fig.to_html(full_html=False, include_plotlyjs=False)
+
+
+def create_volatility_chart(df):
+    fig = px.bar(
+        df,
+        x="Ticker",
+        y="Annualized Volatility %",
+        title="Annualized Volatility",
+        text="Annualized Volatility %",
+        color="Annualized Volatility %",
+        color_continuous_scale="Reds"
+    )
+
+    fig.update_traces(texttemplate="%{text:.2f}%", textposition="outside")
+
+    fig.update_layout(
+        xaxis_title="Stock",
+        yaxis_title="Volatility",
+        template="plotly_white",
+        showlegend=False
+    )
+
+    return fig.to_html(full_html=False, include_plotlyjs=False)
+
+
+# ============================================================
+# AI SUMMARY
+# ============================================================
+
+def generate_ai_summary(df):
+    total_value = df["Current Value"].sum()
+    previous_value = df["Previous Value"].sum()
+    total_daily_gain_loss = df["Daily Gain/Loss"].sum()
+    total_daily_percent = (total_daily_gain_loss / previous_value) * 100 if previous_value != 0 else 0
+
+    total_cost_basis = df["Cost Basis"].sum()
+    total_unrealized_gain_loss = df["Total Gain/Loss"].sum()
+    total_unrealized_percent = (total_unrealized_gain_loss / total_cost_basis) * 100 if total_cost_basis > 0 else 0
+
+    best_stock = df.loc[df["Daily Gain/Loss"].idxmax()]
+    worst_stock = df.loc[df["Daily Gain/Loss"].idxmin()]
+    largest_position = df.loc[df["Portfolio Weight %"].idxmax()]
+
+    prompt = f"""
+You are an AI financial dashboard assistant.
+
+Formatting rules:
+Do not use markdown.
+Do not use asterisks.
+Do not use hashtags.
+Do not use code blocks.
+Use plain sentences only.
+Keep every point short.
+Do not give official financial advice.
+
+Portfolio data:
+{df.to_string(index=False)}
+
+Write this exact structure:
+
+Portfolio Summary:
+- Explain today's total portfolio movement.
+- Mention the total portfolio value.
+- Mention daily gain or loss.
+
+Best Performer:
+- Explain which stock helped the most today and why.
+
+Worst Performer:
+- Explain which stock hurt the most today and why.
+
+Total Gain or Loss:
+- Explain the total gain or loss compared to average cost.
+
+Risk and Trend Notes:
+- Mention RSI, moving averages, volatility, and allocation.
+- Mention if the portfolio depends heavily on one stock.
+
+Beginner Takeaway:
+- Give one simple takeaway.
 """
 
-ai_summary = ask_ollama(ai_prompt)
+    try:
+        result = subprocess.run(
+            ["ollama", "run", "llama3.2"],
+            input=prompt,
+            text=True,
+            capture_output=True,
+            timeout=90
+        )
 
-df["Performance Color"] = df["Daily Change %"].apply(
-    lambda x: "Gain" if x >= 0 else "Loss"
-)
+        if result.returncode == 0 and result.stdout.strip():
+            return clean_ai_text(result.stdout.strip())
 
-bar_chart = px.bar(
-    df,
-    x="Ticker",
-    y="Daily Change %",
-    color="Performance Color",
-    title="Daily Stock Performance",
-    color_discrete_map={
-        "Gain": "#22c55e",
-        "Loss": "#ef4444"
-    }
-)
+    except Exception as error:
+        print(f"Ollama failed: {error}")
 
-price_data = yf.download(watchlist, period="5d")["Close"]
+    backup = f"""
+Portfolio Summary:
+Your portfolio is worth {format_money(total_value)}.
+Your daily gain or loss is {get_sign(total_daily_gain_loss)}{format_money(total_daily_gain_loss)}, which is {get_sign(total_daily_percent)}{format_percent(total_daily_percent)} today.
 
-normalized_price_data = ((price_data / price_data.iloc[0]) - 1) * 100
+Best Performer:
+The best performer today is {best_stock["Ticker"]}, with a daily impact of {format_money(best_stock["Daily Gain/Loss"])}.
 
-line_chart = px.line(
-    normalized_price_data,
-    title="5-Day Percentage Trend"
-)
+Worst Performer:
+The worst performer today is {worst_stock["Ticker"]}, with a daily impact of {format_money(worst_stock["Daily Gain/Loss"])}.
 
-line_chart.update_layout(
-    yaxis_title="Percent Change Since Start of Period",
-    xaxis_title="Date"
-)
+Total Gain or Loss:
+Your total gain or loss compared to average cost is {get_sign(total_unrealized_gain_loss)}{format_money(total_unrealized_gain_loss)}, which is {get_sign(total_unrealized_percent)}{format_percent(total_unrealized_percent)}.
 
-ticker_items = ""
+Risk and Trend Notes:
+Your largest position is {largest_position["Ticker"]}, which is {format_percent(largest_position["Portfolio Weight %"])} of your portfolio.
+Watch allocation, moving averages, RSI, volatility, and whether too much of the portfolio depends on one stock.
 
-for _, row in df.iterrows():
-    change_class = "positive" if row["Daily Change %"] >= 0 else "negative"
+Beginner Takeaway:
+Do not only look at daily gains and losses. Also watch long-term trend, risk, and portfolio concentration.
+"""
 
-    ticker_items += f"""
-    <span class="ticker-item">
-        <strong>{row["Ticker"]}</strong>
-        ${row["Current Price"]}
-        <span class="{change_class}">
-            {row["Daily Change %"]}%
-        </span>
-    </span>
+    return clean_ai_text(backup)
+
+
+# ============================================================
+# HTML REPORT
+# ============================================================
+
+def create_moving_ticker(df):
+    ticker_items = ""
+
+    for _, row in df.iterrows():
+        change_class = get_positive_negative_class(row["Daily Change %"])
+        sign = get_sign(row["Daily Change %"])
+
+        ticker_items += f"""
+        <div class="ticker-item">
+            <div class="ticker-symbol">{escape(str(row["Ticker"]))}</div>
+            <div class="ticker-company">{escape(str(row["Company"]))}</div>
+            <div class="ticker-price">{format_money(row["Current Price"])}</div>
+            <div class="{change_class}">{sign}{format_percent(row["Daily Change %"])}</div>
+        </div>
+        """
+
+    return ticker_items + ticker_items
+
+
+def create_table_html(df):
+    rows = ""
+
+    for _, row in df.iterrows():
+        daily_class = get_positive_negative_class(row["Daily Gain/Loss"])
+        daily_percent_class = get_positive_negative_class(row["Daily Change %"])
+        total_class = get_positive_negative_class(row["Total Gain/Loss"])
+        total_percent_class = get_positive_negative_class(row["Total Gain/Loss %"])
+
+        rows += f"""
+        <tr>
+            <td><strong>{escape(str(row["Ticker"]))}</strong></td>
+            <td>{escape(str(row["Company"]))}</td>
+            <td>{row["Shares"]:.4g}</td>
+            <td>{format_money(row["Average Cost"])}</td>
+            <td>{format_money(row["Current Price"])}</td>
+            <td class="{daily_percent_class}">{get_sign(row["Daily Change %"])}{format_percent(row["Daily Change %"])}</td>
+            <td class="{daily_class}">{get_sign(row["Daily Gain/Loss"])}{format_money(row["Daily Gain/Loss"])}</td>
+            <td>{format_money(row["Current Value"])}</td>
+            <td>{format_percent(row["Portfolio Weight %"])}</td>
+            <td>{format_money(row["Cost Basis"])}</td>
+            <td class="{total_class}">{get_sign(row["Total Gain/Loss"])}{format_money(row["Total Gain/Loss"])}</td>
+            <td class="{total_percent_class}">{get_sign(row["Total Gain/Loss %"])}{format_percent(row["Total Gain/Loss %"])}</td>
+            <td>{format_percent(row["5D Return %"])}</td>
+            <td>{format_percent(row["1M Return %"])}</td>
+            <td>{format_percent(row["3M Return %"])}</td>
+            <td>{row["RSI"] if pd.notna(row["RSI"]) else "N/A"}</td>
+            <td>{escape(str(row["RSI Signal"]))}</td>
+            <td>{escape(str(row["Trend Signal"]))}</td>
+            <td>{format_percent(row["Annualized Volatility %"])}</td>
+            <td>{format_money(row["52W High"])}</td>
+            <td>{format_money(row["52W Low"])}</td>
+            <td>{format_percent(row["Distance From 52W High %"])}</td>
+        </tr>
+        """
+
+    return f"""
+    <table class="portfolio-table">
+        <thead>
+            <tr>
+                <th>Ticker</th>
+                <th>Company</th>
+                <th>Shares</th>
+                <th>Avg Cost</th>
+                <th>Price</th>
+                <th>Daily %</th>
+                <th>Daily $</th>
+                <th>Value</th>
+                <th>Weight</th>
+                <th>Cost Basis</th>
+                <th>Total $</th>
+                <th>Total %</th>
+                <th>5D</th>
+                <th>1M</th>
+                <th>3M</th>
+                <th>RSI</th>
+                <th>RSI Signal</th>
+                <th>Trend</th>
+                <th>Volatility</th>
+                <th>52W High</th>
+                <th>52W Low</th>
+                <th>From 52W High</th>
+            </tr>
+        </thead>
+        <tbody>
+            {rows}
+        </tbody>
+    </table>
     """
 
-html_file = reports_folder / f"dashboard_{today}.html"
 
-html_content = f"""
+def create_html_report(df, ai_summary):
+    REPORTS_FOLDER.mkdir(exist_ok=True)
+
+    tickers = df["Ticker"].tolist()
+
+    total_value = df["Current Value"].sum()
+    previous_value = df["Previous Value"].sum()
+    total_daily_gain_loss = df["Daily Gain/Loss"].sum()
+    total_daily_percent = (total_daily_gain_loss / previous_value) * 100 if previous_value != 0 else 0
+
+    total_cost_basis = df["Cost Basis"].sum()
+    total_gain_loss = df["Total Gain/Loss"].sum()
+    total_gain_loss_percent = (total_gain_loss / total_cost_basis) * 100 if total_cost_basis > 0 else 0
+
+    best_stock = df.loc[df["Daily Gain/Loss"].idxmax()]
+    worst_stock = df.loc[df["Daily Gain/Loss"].idxmin()]
+    largest_position = df.loc[df["Portfolio Weight %"].idxmax()]
+
+    ticker_html = create_moving_ticker(df)
+    table_html = create_table_html(df)
+    ai_summary_html = format_ai_summary_as_html(ai_summary)
+
+    portfolio_value_chart = create_portfolio_value_chart(df)
+    daily_gain_loss_chart = create_daily_gain_loss_chart(df)
+    total_gain_loss_chart = create_total_gain_loss_chart(df)
+    allocation_chart = create_allocation_chart(df)
+    normalized_chart = create_normalized_performance_chart(tickers)
+    moving_average_chart = create_moving_average_chart(tickers)
+    volatility_chart = create_volatility_chart(df)
+
+    html = f"""
+<!DOCTYPE html>
 <html>
 <head>
+    <meta charset="UTF-8">
     <title>AI Financial Dashboard</title>
 
     <style>
         body {{
-            margin: 0;
-            font-family: Arial, Helvetica, sans-serif;
-            background-color: #f4f6f8;
+            font-family: Arial, sans-serif;
+            background: #f4f6f8;
             color: #222;
-        }}
-
-        .header {{
-            background-color: #111827;
-            color: white;
-            padding: 30px;
-            text-align: center;
-        }}
-
-        .header h1 {{
             margin: 0;
-            font-size: 36px;
-        }}
-
-        .header p {{
-            margin-top: 10px;
-            color: #d1d5db;
-        }}
-
-        .ticker-wrap {{
-            width: 100%;
-            overflow: hidden;
-            background-color: #020617;
-            color: white;
-            padding: 12px 0;
-            white-space: nowrap;
-            box-sizing: border-box;
-        }}
-
-        .ticker {{
-            display: inline-block;
-            padding-left: 100%;
-            animation: ticker-scroll 30s linear infinite;
-        }}
-
-        .ticker-item {{
-            display: inline-block;
-            margin-right: 45px;
-            font-size: 16px;
-        }}
-
-        @keyframes ticker-scroll {{
-            0% {{
-                transform: translateX(0);
-            }}
-            100% {{
-                transform: translateX(-100%);
-            }}
-        }}
-
-        .positive {{
-            color: #22c55e;
-            font-weight: bold;
-        }}
-
-        .negative {{
-            color: #ef4444;
-            font-weight: bold;
+            padding: 0;
         }}
 
         .container {{
-            width: 90%;
-            max-width: 1200px;
-            margin: 30px auto;
+            max-width: 1300px;
+            margin: auto;
+            padding: 30px;
         }}
 
-        .card {{
-            background-color: white;
-            border-radius: 14px;
-            padding: 24px;
+        h1 {{
+            text-align: center;
+            margin-bottom: 5px;
+        }}
+
+        .subtitle {{
+            text-align: center;
+            color: #666;
             margin-bottom: 25px;
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.07);
         }}
 
-        .stats-grid {{
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 20px;
+        .ticker-wrapper {{
+            overflow: hidden;
+            background: #111827;
+            padding: 15px;
+            border-radius: 18px;
+            margin-bottom: 25px;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.18);
         }}
 
-        .stat-card {{
-            background-color: #f9fafb;
-            border-left: 5px solid #2563eb;
-            padding: 18px;
-            border-radius: 10px;
+        .ticker-track {{
+            display: flex;
+            gap: 15px;
+            width: max-content;
+            animation: tickerMove 25s linear infinite;
         }}
 
-        .stat-card h3 {{
-            margin: 0 0 8px 0;
-            color: #374151;
+        .ticker-wrapper:hover .ticker-track {{
+            animation-play-state: paused;
         }}
 
-        .stat-card p {{
-            margin: 0;
+        @keyframes tickerMove {{
+            from {{
+                transform: translateX(0);
+            }}
+            to {{
+                transform: translateX(-50%);
+            }}
+        }}
+
+        .ticker-item {{
+            min-width: 180px;
+            background: #1f2937;
+            color: white;
+            padding: 14px;
+            border-radius: 14px;
+            text-align: center;
+            flex-shrink: 0;
+        }}
+
+        .ticker-symbol {{
             font-size: 22px;
             font-weight: bold;
         }}
 
-        table {{
+        .ticker-company {{
+            font-size: 12px;
+            color: #d1d5db;
+            margin-top: 4px;
+            height: 16px;
+            overflow: hidden;
+        }}
+
+        .ticker-price {{
+            font-size: 17px;
+            margin-top: 6px;
+        }}
+
+        .cards {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }}
+
+        .card {{
+            background: white;
+            padding: 22px;
+            border-radius: 16px;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.08);
+        }}
+
+        .card h2 {{
+            margin-top: 0;
+            color: #555;
+            font-size: 17px;
+        }}
+
+        .value {{
+            font-size: 28px;
+            font-weight: bold;
+        }}
+
+        .small-note {{
+            color: #777;
+            font-size: 14px;
+            margin-top: 8px;
+        }}
+
+        .positive {{
+            color: green;
+            font-weight: bold;
+        }}
+
+        .negative {{
+            color: red;
+            font-weight: bold;
+        }}
+
+        .section {{
+            background: white;
+            padding: 25px;
+            border-radius: 16px;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.08);
+            margin-bottom: 30px;
+            overflow-x: auto;
+        }}
+
+        .ai-summary {{
+            line-height: 1.6;
+            background: #f9fafb;
+            padding: 18px;
+            border-radius: 12px;
+            border-left: 5px solid #111827;
+        }}
+
+        .ai-summary h3 {{
+            margin-bottom: 8px;
+            margin-top: 18px;
+            color: #111827;
+        }}
+
+        .ai-summary h3:first-child {{
+            margin-top: 0;
+        }}
+
+        .ai-summary ul {{
+            margin-top: 5px;
+            margin-bottom: 12px;
+            padding-left: 24px;
+        }}
+
+        .ai-summary li {{
+            margin-bottom: 8px;
+        }}
+
+        .portfolio-table {{
             width: 100%;
             border-collapse: collapse;
-            font-size: 14px;
+            font-size: 13px;
         }}
 
-        th {{
-            background-color: #111827;
+        .portfolio-table th,
+        .portfolio-table td {{
+            border: 1px solid #ddd;
+            padding: 9px;
+            text-align: center;
+            white-space: nowrap;
+        }}
+
+        .portfolio-table th {{
+            background: #111827;
             color: white;
-            padding: 12px;
-            text-align: left;
         }}
 
-        td {{
-            padding: 10px;
-            border-bottom: 1px solid #e5e7eb;
+        .portfolio-table tr:nth-child(even) {{
+            background: #f9fafb;
         }}
 
-        tr:hover {{
-            background-color: #f3f4f6;
-        }}
-
-        pre {{
-            white-space: pre-wrap;
-            line-height: 1.6;
-            font-family: Arial, Helvetica, sans-serif;
-            background-color: #f9fafb;
-            padding: 20px;
-            border-radius: 10px;
-            border-left: 5px solid #2563eb;
-        }}
-
-        .note {{
-            color: #6b7280;
+        .footer {{
+            text-align: center;
+            color: #777;
+            margin-top: 30px;
             font-size: 14px;
         }}
     </style>
 </head>
 
 <body>
-    <div class="header">
-        <h1>AI Financial Dashboard</h1>
-        <p>Generated on {datetime.now().strftime("%Y-%m-%d %I:%M %p")}</p>
-    </div>
-
-    <div class="ticker-wrap">
-        <div class="ticker">
-            {ticker_items}
-            {ticker_items}
-        </div>
-    </div>
-
     <div class="container">
+        <h1>AI Financial Dashboard</h1>
+        <p class="subtitle">Generated on {datetime.now().strftime("%B %d, %Y at %I:%M %p")}</p>
 
-        <div class="card">
-            <h2>Quick Market Stats</h2>
-
-            <div class="stats-grid">
-                <div class="stat-card">
-                    <h3>Best Performer</h3>
-                    <p>{best_stock["Ticker"]} ({best_stock["Daily Change %"]}%)</p>
-                </div>
-
-                <div class="stat-card">
-                    <h3>Worst Performer</h3>
-                    <p>{worst_stock["Ticker"]} ({worst_stock["Daily Change %"]}%)</p>
-                </div>
-
-                <div class="stat-card">
-                    <h3>Average Watchlist Change</h3>
-                    <p>{average_change}%</p>
-                </div>
+        <div class="ticker-wrapper">
+            <div class="ticker-track">
+                {ticker_html}
             </div>
         </div>
 
-        <div class="card">
-            <h2>AI Market Research Summary</h2>
-            <pre>{ai_summary}</pre>
+        <div class="cards">
+            <div class="card">
+                <h2>Total Portfolio Value</h2>
+                <div class="value">{format_money(total_value)}</div>
+                <div class="small-note">Current value of your holdings</div>
+            </div>
+
+            <div class="card">
+                <h2>Daily Gain/Loss</h2>
+                <div class="value {get_positive_negative_class(total_daily_gain_loss)}">
+                    {get_sign(total_daily_gain_loss)}{format_money(total_daily_gain_loss)}
+                </div>
+                <div class="small-note">{get_sign(total_daily_percent)}{format_percent(total_daily_percent)} today</div>
+            </div>
+
+            <div class="card">
+                <h2>Total Gain/Loss</h2>
+                <div class="value {get_positive_negative_class(total_gain_loss)}">
+                    {get_sign(total_gain_loss)}{format_money(total_gain_loss)}
+                </div>
+                <div class="small-note">{get_sign(total_gain_loss_percent)}{format_percent(total_gain_loss_percent)} vs average cost</div>
+            </div>
+
+            <div class="card">
+                <h2>Best Performer</h2>
+                <div class="value positive">{escape(str(best_stock["Ticker"]))}</div>
+                <div class="small-note">{format_money(best_stock["Daily Gain/Loss"])} today</div>
+            </div>
+
+            <div class="card">
+                <h2>Worst Performer</h2>
+                <div class="value negative">{escape(str(worst_stock["Ticker"]))}</div>
+                <div class="small-note">{format_money(worst_stock["Daily Gain/Loss"])} today</div>
+            </div>
+
+            <div class="card">
+                <h2>Largest Position</h2>
+                <div class="value">{escape(str(largest_position["Ticker"]))}</div>
+                <div class="small-note">{format_percent(largest_position["Portfolio Weight %"])} of portfolio</div>
+            </div>
         </div>
 
-        <div class="card">
-            <h2>Market Watchlist</h2>
-            <p class="note">Some fields may show Not Applicable for ETFs, indexes, or crypto because those assets do not always have company-style metrics like sector, industry, or P/E ratio.</p>
-            {df.drop(columns=["Performance Color"]).to_html(index=False)}
+        <div class="section">
+            <h2>AI Portfolio Summary</h2>
+            <div class="ai-summary">
+                {ai_summary_html}
+            </div>
         </div>
 
-        <div class="card">
-            <h2>Daily Performance Chart</h2>
-            {bar_chart.to_html(full_html=False)}
+        <div class="section">
+            <h2>Portfolio Metrics Table</h2>
+            {table_html}
         </div>
 
-        <div class="card">
-            <h2>5-Day Percentage Trend</h2>
-            <p class="note">This chart uses percentage change instead of raw price, so stocks, ETFs, and crypto can be compared on the same scale.</p>
-            {line_chart.to_html(full_html=False)}
+        <div class="section">
+            {portfolio_value_chart}
         </div>
 
-        <div class="card">
-            <h2>Latest Headlines</h2>
-            {news_df.to_html(index=False)}
+        <div class="section">
+            {daily_gain_loss_chart}
         </div>
 
+        <div class="section">
+            {total_gain_loss_chart}
+        </div>
+
+        <div class="section">
+            {allocation_chart}
+        </div>
+
+        <div class="section">
+            {normalized_chart}
+        </div>
+
+        <div class="section">
+            {moving_average_chart}
+        </div>
+
+        <div class="section">
+            {volatility_chart}
+        </div>
+
+        <p class="footer">
+            Portfolio is entered in the Terminal. This dashboard is display only. Data is latest available from yfinance and is not professional tick-by-tick trading data. This is not financial advice.
+        </p>
     </div>
 </body>
 </html>
 """
 
-with open(html_file, "w") as file:
-    file.write(html_content)
+    with open(REPORT_FILE, "w", encoding="utf-8") as file:
+        file.write(html)
 
-print("\nAI Financial Dashboard Report")
-print(df.drop(columns=["Performance Color"]))
+    return REPORT_FILE.resolve()
 
-print("\nAI Market Research Summary")
-print(ai_summary)
 
-print(f"\nCSV report saved to: {csv_file}")
-print(f"News report saved to: {news_csv_file}")
-print(f"HTML dashboard saved to: {html_file}")
+def open_report(report_path):
+    if report_path.exists():
+        webbrowser.open(f"file://{report_path}")
+        print(f"Opened report: {report_path}")
+    else:
+        print(f"Report not found: {report_path}")
+
+
+# ============================================================
+# MAIN PROGRAM
+# ============================================================
+
+def main():
+    print("Building AI financial dashboard...")
+
+    portfolio_input = load_portfolio()
+    print("Portfolio input loaded.")
+
+    df = build_portfolio_dataframe(portfolio_input)
+
+    if df.empty:
+        print("No stock data found. Check your tickers or internet connection.")
+        return
+
+    print("Portfolio data loaded.")
+    print(df)
+
+    ai_summary = generate_ai_summary(df)
+    print("AI summary created.")
+
+    report_path = create_html_report(df, ai_summary)
+    print(f"Report saved to: {report_path}")
+
+    open_report(report_path)
+
+    send_mac_notification(
+        "AI Financial Dashboard",
+        "Your financial dashboard is ready."
+    )
+
+
+if __name__ == "__main__":
+    main()
