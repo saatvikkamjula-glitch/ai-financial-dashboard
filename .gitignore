@@ -5,3 +5,4 @@ __pycache__/
 reports/
 *.log
 portfolio.csvwatchlist.csv
+watchlist.csv
