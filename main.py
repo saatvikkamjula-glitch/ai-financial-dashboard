@@ -139,38 +139,23 @@ def send_mac_notification(title, message):
 
 
 def clean_ai_text(text):
-    """
-    Cleans Ollama output so the dashboard does not show weird symbols like:
-    [2D, [K, escape codes, asterisks, markdown marks, or broken formatting.
-    """
     if not text:
         return ""
 
-    # Remove ANSI escape codes like ESC[2D, ESC[K, etc.
     ansi_escape_pattern = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
     text = ansi_escape_pattern.sub("", text)
 
-    # Remove leftover broken escape-looking text
     text = re.sub(r"\[[0-9;?]*[A-Za-z]", "", text)
-
-    # Remove common markdown symbols
     text = text.replace("*", "")
     text = text.replace("#", "")
     text = text.replace("`", "")
-
-    # Clean extra spaces
     text = re.sub(r"[ \t]+", " ", text)
-
-    # Clean extra blank lines
     text = re.sub(r"\n{3,}", "\n\n", text)
 
     return text.strip()
 
 
 def format_ai_summary_as_html(text):
-    """
-    Converts the cleaned AI summary into readable HTML with bullet points.
-    """
     text = clean_ai_text(text)
 
     if not text:
@@ -184,25 +169,22 @@ def format_ai_summary_as_html(text):
     for line in lines:
         clean_line = line.strip()
 
-        if not clean_line:
-            continue
-
-        # Remove existing bullet symbols and numbers
         clean_line = re.sub(r"^[-•]\s*", "", clean_line)
         clean_line = re.sub(r"^\d+\.\s*", "", clean_line)
 
-        # If it looks like a heading, make it a small heading
         lower_line = clean_line.lower()
         is_heading = (
-            lower_line in [
-                "today's summary",
+            clean_line.endswith(":")
+            or lower_line in [
                 "portfolio summary",
-                "key takeaways",
-                "what happened today",
-                "things to watch",
-                "important things to watch"
+                "best performer",
+                "worst performer",
+                "total gain or loss",
+                "risk and trend notes",
+                "market and stock news",
+                "beginner takeaway",
+                "things to watch"
             ]
-            or clean_line.endswith(":")
         )
 
         if is_heading:
@@ -477,6 +459,196 @@ def build_portfolio_dataframe(portfolio_input):
 
 
 # ============================================================
+# NEWS FUNCTIONS
+# ============================================================
+
+# ============================================================
+# NEWS FUNCTIONS
+# ============================================================
+
+def get_nested_value(dictionary, keys, default=None):
+    """
+    Safely gets a nested value from a dictionary.
+
+    Example:
+    get_nested_value(article, ["content", "title"])
+    """
+    current = dictionary
+
+    for key in keys:
+        if not isinstance(current, dict):
+            return default
+
+        current = current.get(key)
+
+        if current is None:
+            return default
+
+    return current
+
+
+def extract_news_article(article, ticker):
+    """
+    Handles multiple yfinance/Yahoo Finance news formats.
+
+    Some yfinance versions return:
+    article["title"]
+    article["publisher"]
+    article["link"]
+
+    Other versions return nested data like:
+    article["content"]["title"]
+    article["content"]["provider"]["displayName"]
+    article["content"]["canonicalUrl"]["url"]
+    """
+
+    title = (
+        article.get("title")
+        or get_nested_value(article, ["content", "title"])
+        or get_nested_value(article, ["content", "headline"])
+        or "No title available"
+    )
+
+    publisher = (
+        article.get("publisher")
+        or get_nested_value(article, ["content", "provider", "displayName"])
+        or get_nested_value(article, ["content", "provider", "name"])
+        or article.get("provider")
+        or "Unknown source"
+    )
+
+    link = (
+        article.get("link")
+        or get_nested_value(article, ["content", "canonicalUrl", "url"])
+        or get_nested_value(article, ["content", "clickThroughUrl", "url"])
+        or get_nested_value(article, ["content", "previewUrl"])
+        or ""
+    )
+
+    publish_time = (
+        article.get("providerPublishTime")
+        or article.get("pubDate")
+        or get_nested_value(article, ["content", "pubDate"])
+        or get_nested_value(article, ["content", "displayTime"])
+    )
+
+    date_text = "Recent"
+
+    if publish_time:
+        try:
+            if isinstance(publish_time, (int, float)):
+                date_text = datetime.fromtimestamp(publish_time).strftime("%b %d, %Y")
+            else:
+                date_text = str(publish_time)[:10]
+        except Exception:
+            date_text = "Recent"
+
+    title = str(title).strip()
+    publisher = str(publisher).strip()
+    link = str(link).strip()
+
+    if not title or title.lower() in ["none", "null"]:
+        title = "No title available"
+
+    if not publisher or publisher.lower() in ["none", "null"]:
+        publisher = "Unknown source"
+
+    return {
+        "Ticker": ticker,
+        "Title": title,
+        "Publisher": publisher,
+        "Date": date_text,
+        "Link": link,
+    }
+
+
+def get_stock_news(tickers, max_articles_per_ticker=3):
+    """
+    Pulls recent news from yfinance for each stock.
+    Handles both old and newer yfinance news formats.
+    """
+    news_items = []
+
+    for ticker in tickers:
+        try:
+            stock = yf.Ticker(ticker)
+            articles = stock.news or []
+
+            count = 0
+
+            for article in articles:
+                if count >= max_articles_per_ticker:
+                    break
+
+                extracted = extract_news_article(article, ticker)
+
+                # Skip completely useless empty articles
+                if (
+                    extracted["Title"] == "No title available"
+                    and extracted["Publisher"] == "Unknown source"
+                ):
+                    continue
+
+                news_items.append(extracted)
+                count += 1
+
+        except Exception as error:
+            print(f"Could not get news for {ticker}: {error}")
+
+    return news_items
+
+
+def create_news_html(news_items):
+    if not news_items:
+        return """
+        <div class="news-empty">
+            No recent stock news was found from yfinance for these tickers.
+        </div>
+        """
+
+    cards = ""
+
+    for item in news_items:
+        ticker = escape(str(item["Ticker"]))
+        title = escape(str(item["Title"]))
+        publisher = escape(str(item["Publisher"]))
+        date_text = escape(str(item["Date"]))
+        link = escape(str(item["Link"]))
+
+        if link:
+            title_html = f'<a href="{link}" target="_blank">{title}</a>'
+        else:
+            title_html = title
+
+        cards += f"""
+        <div class="news-card">
+            <div class="news-ticker">{ticker}</div>
+            <div class="news-title">{title_html}</div>
+            <div class="news-meta">{publisher} • {date_text}</div>
+        </div>
+        """
+
+    return f"""
+    <div class="news-grid">
+        {cards}
+    </div>
+    """
+
+
+def news_items_to_text(news_items, max_items=10):
+    if not news_items:
+        return "No recent stock news found."
+
+    lines = []
+
+    for item in news_items[:max_items]:
+        lines.append(
+            f'{item["Ticker"]}: {item["Title"]} from {item["Publisher"]} on {item["Date"]}'
+        )
+
+    return "\n".join(lines)
+
+# ============================================================
 # CHARTS
 # ============================================================
 
@@ -665,7 +837,7 @@ def create_volatility_chart(df):
 # AI SUMMARY
 # ============================================================
 
-def generate_ai_summary(df):
+def generate_ai_summary(df, news_items):
     total_value = df["Current Value"].sum()
     previous_value = df["Previous Value"].sum()
     total_daily_gain_loss = df["Daily Gain/Loss"].sum()
@@ -678,6 +850,8 @@ def generate_ai_summary(df):
     best_stock = df.loc[df["Daily Gain/Loss"].idxmax()]
     worst_stock = df.loc[df["Daily Gain/Loss"].idxmin()]
     largest_position = df.loc[df["Portfolio Weight %"].idxmax()]
+
+    news_text = news_items_to_text(news_items)
 
     prompt = f"""
 You are an AI financial dashboard assistant.
@@ -693,6 +867,9 @@ Do not give official financial advice.
 
 Portfolio data:
 {df.to_string(index=False)}
+
+Recent stock news:
+{news_text}
 
 Write this exact structure:
 
@@ -714,6 +891,11 @@ Risk and Trend Notes:
 - Mention RSI, moving averages, volatility, and allocation.
 - Mention if the portfolio depends heavily on one stock.
 
+Market and Stock News:
+- Summarize the most important news items.
+- Explain which news may matter to the portfolio.
+- If the news is not clearly connected to a price move, say that clearly.
+
 Beginner Takeaway:
 - Give one simple takeaway.
 """
@@ -724,7 +906,7 @@ Beginner Takeaway:
             input=prompt,
             text=True,
             capture_output=True,
-            timeout=90
+            timeout=120
         )
 
         if result.returncode == 0 and result.stdout.strip():
@@ -751,8 +933,12 @@ Risk and Trend Notes:
 Your largest position is {largest_position["Ticker"]}, which is {format_percent(largest_position["Portfolio Weight %"])} of your portfolio.
 Watch allocation, moving averages, RSI, volatility, and whether too much of the portfolio depends on one stock.
 
+Market and Stock News:
+The dashboard found {len(news_items)} recent stock news items from yfinance.
+Read the news cards below to see what may have affected your holdings.
+
 Beginner Takeaway:
-Do not only look at daily gains and losses. Also watch long-term trend, risk, and portfolio concentration.
+Do not only look at daily gains and losses. Also watch news, long-term trend, risk, and portfolio concentration.
 """
 
     return clean_ai_text(backup)
@@ -852,7 +1038,7 @@ def create_table_html(df):
     """
 
 
-def create_html_report(df, ai_summary):
+def create_html_report(df, ai_summary, news_items):
     REPORTS_FOLDER.mkdir(exist_ok=True)
 
     tickers = df["Ticker"].tolist()
@@ -873,6 +1059,7 @@ def create_html_report(df, ai_summary):
     ticker_html = create_moving_ticker(df)
     table_html = create_table_html(df)
     ai_summary_html = format_ai_summary_as_html(ai_summary)
+    news_html = create_news_html(news_items)
 
     portfolio_value_chart = create_portfolio_value_chart(df)
     daily_gain_loss_chart = create_daily_gain_loss_chart(df)
@@ -1073,6 +1260,59 @@ def create_html_report(df, ai_summary):
             background: #f9fafb;
         }}
 
+        .news-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 16px;
+        }}
+
+        .news-card {{
+            background: #f9fafb;
+            border: 1px solid #e5e7eb;
+            border-radius: 14px;
+            padding: 16px;
+        }}
+
+        .news-ticker {{
+            display: inline-block;
+            background: #111827;
+            color: white;
+            font-weight: bold;
+            font-size: 13px;
+            padding: 5px 9px;
+            border-radius: 999px;
+            margin-bottom: 10px;
+        }}
+
+        .news-title {{
+            font-size: 15px;
+            font-weight: bold;
+            line-height: 1.4;
+            margin-bottom: 8px;
+        }}
+
+        .news-title a {{
+            color: #111827;
+            text-decoration: none;
+        }}
+
+        .news-title a:hover {{
+            text-decoration: underline;
+        }}
+
+        .news-meta {{
+            color: #666;
+            font-size: 13px;
+        }}
+
+        .news-empty {{
+            background: #f9fafb;
+            border: 1px solid #e5e7eb;
+            border-radius: 14px;
+            padding: 16px;
+            color: #666;
+        }}
+
         .footer {{
             text-align: center;
             color: #777;
@@ -1143,6 +1383,11 @@ def create_html_report(df, ai_summary):
         </div>
 
         <div class="section">
+            <h2>Recent Stock News</h2>
+            {news_html}
+        </div>
+
+        <div class="section">
             <h2>Portfolio Metrics Table</h2>
             {table_html}
         </div>
@@ -1176,7 +1421,7 @@ def create_html_report(df, ai_summary):
         </div>
 
         <p class="footer">
-            Portfolio is entered in the Terminal. This dashboard is display only. Data is latest available from yfinance and is not professional tick-by-tick trading data. This is not financial advice.
+            Portfolio is entered in the Terminal. This dashboard is display only. Data and news are latest available from yfinance and are not professional tick-by-tick trading data. This is not financial advice.
         </p>
     </div>
 </body>
@@ -1216,17 +1461,23 @@ def main():
     print("Portfolio data loaded.")
     print(df)
 
-    ai_summary = generate_ai_summary(df)
+    tickers = df["Ticker"].tolist()
+
+    print("Gathering recent stock news...")
+    news_items = get_stock_news(tickers)
+    print(f"Found {len(news_items)} news items.")
+
+    ai_summary = generate_ai_summary(df, news_items)
     print("AI summary created.")
 
-    report_path = create_html_report(df, ai_summary)
+    report_path = create_html_report(df, ai_summary, news_items)
     print(f"Report saved to: {report_path}")
 
     open_report(report_path)
 
     send_mac_notification(
         "AI Financial Dashboard",
-        "Your financial dashboard is ready."
+        "Your financial dashboard with news is ready."
     )
 
 
