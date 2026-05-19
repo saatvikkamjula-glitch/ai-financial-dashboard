@@ -18,12 +18,13 @@ import yfinance as yf
 # ============================================================
 
 PORTFOLIO_FILE = Path("portfolio.csv")
+WATCHLIST_FILE = Path("watchlist.csv")
 REPORTS_FOLDER = Path("reports")
 REPORT_FILE = REPORTS_FOLDER / "financial_dashboard.html"
 
 
 # ============================================================
-# PORTFOLIO INPUT
+# INPUT FUNCTIONS
 # ============================================================
 
 def ask_yes_no(question):
@@ -41,6 +42,7 @@ def ask_yes_no(question):
 
 def create_portfolio_from_terminal():
     print("\nEnter your portfolio.")
+    print("These are stocks you own.")
     print("Example tickers: AAPL, MSFT, NVDA, TSLA, SPY")
     print("When you are done, press Enter without typing a ticker.\n")
 
@@ -73,7 +75,6 @@ def create_portfolio_from_terminal():
 
     if not holdings:
         print("No holdings entered. Creating sample portfolio instead.")
-
         holdings = [
             {"Ticker": "AAPL", "Shares": 2, "Average Cost": 180},
             {"Ticker": "MSFT", "Shares": 1, "Average Cost": 400},
@@ -84,7 +85,6 @@ def create_portfolio_from_terminal():
 
     df = pd.DataFrame(holdings)
     df.to_csv(PORTFOLIO_FILE, index=False)
-
     print(f"\nSaved portfolio to {PORTFOLIO_FILE}.\n")
 
     return df
@@ -116,6 +116,63 @@ def load_portfolio():
 
     if df.empty:
         raise ValueError("No valid portfolio holdings found.")
+
+    return df
+
+
+def create_watchlist_from_terminal():
+    print("\nEnter your watchlist.")
+    print("These are stocks you want to track but do not own yet.")
+    print("Example tickers: AMD, GOOGL, META, JPM, COST")
+    print("When you are done, press Enter without typing a ticker.\n")
+
+    tickers = []
+
+    while True:
+        ticker = input("Watchlist ticker: ").strip().upper()
+
+        if ticker == "":
+            break
+
+        if ticker in tickers:
+            print(f"{ticker} is already in your watchlist.\n")
+            continue
+
+        tickers.append(ticker)
+        print(f"Added {ticker} to watchlist.\n")
+
+    if not tickers:
+        print("No watchlist tickers entered. Creating sample watchlist instead.")
+        tickers = ["AMD", "GOOGL", "META", "JPM", "COST"]
+
+    df = pd.DataFrame({"Ticker": tickers})
+    df.to_csv(WATCHLIST_FILE, index=False)
+    print(f"\nSaved watchlist to {WATCHLIST_FILE}.\n")
+
+    return df
+
+
+def load_watchlist():
+    if WATCHLIST_FILE.exists():
+        use_existing = ask_yes_no("Do you want to use your existing watchlist.csv?")
+
+        if use_existing:
+            df = pd.read_csv(WATCHLIST_FILE)
+        else:
+            df = create_watchlist_from_terminal()
+    else:
+        print("watchlist.csv was not found.")
+        df = create_watchlist_from_terminal()
+
+    if "Ticker" not in df.columns:
+        raise ValueError("watchlist.csv must have one column called Ticker")
+
+    df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
+    df = df[df["Ticker"] != ""]
+    df = df.drop_duplicates(subset=["Ticker"])
+
+    if df.empty:
+        df = create_watchlist_from_terminal()
 
     return df
 
@@ -162,30 +219,27 @@ def format_ai_summary_as_html(text):
         return "<p>No AI summary was generated.</p>"
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-
     html_parts = []
     bullet_items = []
 
-    for line in lines:
-        clean_line = line.strip()
+    headings = [
+        "portfolio summary",
+        "best performer",
+        "worst performer",
+        "total gain or loss",
+        "risk and trend notes",
+        "watchlist summary",
+        "watchlist movers",
+        "market and stock news",
+        "beginner takeaway",
+    ]
 
-        clean_line = re.sub(r"^[-•]\s*", "", clean_line)
+    for line in lines:
+        clean_line = re.sub(r"^[-•]\s*", "", line)
         clean_line = re.sub(r"^\d+\.\s*", "", clean_line)
 
         lower_line = clean_line.lower()
-        is_heading = (
-            clean_line.endswith(":")
-            or lower_line in [
-                "portfolio summary",
-                "best performer",
-                "worst performer",
-                "total gain or loss",
-                "risk and trend notes",
-                "market and stock news",
-                "beginner takeaway",
-                "things to watch"
-            ]
-        )
+        is_heading = clean_line.endswith(":") or lower_line in headings
 
         if is_heading:
             if bullet_items:
@@ -229,6 +283,24 @@ def format_percent(value):
         return "N/A"
 
     return f"{value:.2f}%"
+
+
+def format_large_number(value):
+    if value is None or pd.isna(value):
+        return "N/A"
+
+    value = float(value)
+
+    if abs(value) >= 1_000_000_000_000:
+        return f"${value / 1_000_000_000_000:.2f}T"
+
+    if abs(value) >= 1_000_000_000:
+        return f"${value / 1_000_000_000:.2f}B"
+
+    if abs(value) >= 1_000_000:
+        return f"${value / 1_000_000:.2f}M"
+
+    return f"${value:,.2f}"
 
 
 def get_positive_negative_class(value):
@@ -320,6 +392,49 @@ def get_trend_signal(current_price, sma_20, sma_50):
     return "Mixed trend"
 
 
+def get_research_signal(row):
+    score = 0
+
+    daily_change = row.get("Daily Change %")
+    one_month = row.get("1M Return %")
+    rsi = row.get("RSI")
+    trend = row.get("Trend Signal")
+
+    if pd.notna(one_month):
+        if one_month > 5:
+            score += 1
+        elif one_month < -5:
+            score -= 1
+
+    if pd.notna(daily_change):
+        if daily_change > 2:
+            score += 1
+        elif daily_change < -2:
+            score -= 1
+
+    if pd.notna(rsi):
+        if 40 <= rsi <= 65:
+            score += 1
+        elif rsi >= 75:
+            score -= 1
+
+    if trend == "Bullish trend":
+        score += 1
+    elif trend == "Bearish trend":
+        score -= 1
+
+    if score >= 2:
+        return "Strong watch"
+
+    if score == 1:
+        return "Worth watching"
+
+    if score == 0:
+        return "Neutral"
+
+    return "Caution"
+
+
 # ============================================================
 # STOCK DATA
 # ============================================================
@@ -327,7 +442,6 @@ def get_trend_signal(current_price, sma_20, sma_50):
 def get_stock_data(ticker):
     try:
         stock = yf.Ticker(ticker)
-
         history = stock.history(period="6mo", interval="1d")
 
         if history.empty or len(history) < 2:
@@ -406,7 +520,7 @@ def build_portfolio_dataframe(portfolio_input):
         data = get_stock_data(ticker)
 
         if data is None:
-            print(f"Could not get data for {ticker}")
+            print(f"Could not get portfolio data for {ticker}")
             continue
 
         current_value = data["current_price"] * shares
@@ -458,21 +572,54 @@ def build_portfolio_dataframe(portfolio_input):
     return df
 
 
-# ============================================================
-# NEWS FUNCTIONS
-# ============================================================
+def build_watchlist_dataframe(watchlist_input):
+    rows = []
+
+    for _, item in watchlist_input.iterrows():
+        ticker = item["Ticker"]
+        data = get_stock_data(ticker)
+
+        if data is None:
+            print(f"Could not get watchlist data for {ticker}")
+            continue
+
+        rows.append({
+            "Ticker": ticker,
+            "Company": data["company_name"],
+            "Current Price": round(data["current_price"], 2),
+            "Previous Price": round(data["previous_price"], 2),
+            "Daily Change": round(data["daily_change"], 2),
+            "Daily Change %": round(data["daily_change_percent"], 2),
+            "5D Return %": round(data["five_day_return"], 2) if data["five_day_return"] is not None else None,
+            "1M Return %": round(data["one_month_return"], 2) if data["one_month_return"] is not None else None,
+            "3M Return %": round(data["three_month_return"], 2) if data["three_month_return"] is not None else None,
+            "20D SMA": round(data["sma_20"], 2) if data["sma_20"] is not None else None,
+            "50D SMA": round(data["sma_50"], 2) if data["sma_50"] is not None else None,
+            "RSI": round(data["rsi"], 2) if data["rsi"] is not None else None,
+            "RSI Signal": data["rsi_signal"],
+            "Trend Signal": data["trend_signal"],
+            "Annualized Volatility %": round(data["annualized_volatility"], 2) if data["annualized_volatility"] is not None else None,
+            "52W High": round(data["year_high"], 2) if data["year_high"] is not None else None,
+            "52W Low": round(data["year_low"], 2) if data["year_low"] is not None else None,
+            "Distance From 52W High %": round(data["distance_from_52w_high"], 2) if data["distance_from_52w_high"] is not None else None,
+            "Market Cap": data["market_cap"],
+        })
+
+    df = pd.DataFrame(rows)
+
+    if df.empty:
+        return df
+
+    df["Research Signal"] = df.apply(get_research_signal, axis=1)
+
+    return df
+
 
 # ============================================================
 # NEWS FUNCTIONS
 # ============================================================
 
 def get_nested_value(dictionary, keys, default=None):
-    """
-    Safely gets a nested value from a dictionary.
-
-    Example:
-    get_nested_value(article, ["content", "title"])
-    """
     current = dictionary
 
     for key in keys:
@@ -488,20 +635,6 @@ def get_nested_value(dictionary, keys, default=None):
 
 
 def extract_news_article(article, ticker):
-    """
-    Handles multiple yfinance/Yahoo Finance news formats.
-
-    Some yfinance versions return:
-    article["title"]
-    article["publisher"]
-    article["link"]
-
-    Other versions return nested data like:
-    article["content"]["title"]
-    article["content"]["provider"]["displayName"]
-    article["content"]["canonicalUrl"]["url"]
-    """
-
     title = (
         article.get("title")
         or get_nested_value(article, ["content", "title"])
@@ -547,26 +680,16 @@ def extract_news_article(article, ticker):
     publisher = str(publisher).strip()
     link = str(link).strip()
 
-    if not title or title.lower() in ["none", "null"]:
-        title = "No title available"
-
-    if not publisher or publisher.lower() in ["none", "null"]:
-        publisher = "Unknown source"
-
     return {
         "Ticker": ticker,
-        "Title": title,
-        "Publisher": publisher,
+        "Title": title if title else "No title available",
+        "Publisher": publisher if publisher else "Unknown source",
         "Date": date_text,
         "Link": link,
     }
 
 
 def get_stock_news(tickers, max_articles_per_ticker=3):
-    """
-    Pulls recent news from yfinance for each stock.
-    Handles both old and newer yfinance news formats.
-    """
     news_items = []
 
     for ticker in tickers:
@@ -582,7 +705,6 @@ def get_stock_news(tickers, max_articles_per_ticker=3):
 
                 extracted = extract_news_article(article, ticker)
 
-                # Skip completely useless empty articles
                 if (
                     extracted["Title"] == "No title available"
                     and extracted["Publisher"] == "Unknown source"
@@ -648,29 +770,15 @@ def news_items_to_text(news_items, max_items=10):
 
     return "\n".join(lines)
 
+
 # ============================================================
 # CHARTS
 # ============================================================
 
 def create_portfolio_value_chart(df):
-    fig = px.bar(
-        df,
-        x="Ticker",
-        y="Current Value",
-        title="Portfolio Value by Stock",
-        text="Current Value",
-        color="Ticker"
-    )
-
+    fig = px.bar(df, x="Ticker", y="Current Value", title="Portfolio Value by Stock", text="Current Value", color="Ticker")
     fig.update_traces(texttemplate="$%{text:.2f}", textposition="outside")
-
-    fig.update_layout(
-        xaxis_title="Stock",
-        yaxis_title="Current Value",
-        template="plotly_white",
-        showlegend=False
-    )
-
+    fig.update_layout(xaxis_title="Stock", yaxis_title="Current Value", template="plotly_white", showlegend=False)
     return fig.to_html(full_html=False, include_plotlyjs="cdn")
 
 
@@ -687,13 +795,7 @@ def create_daily_gain_loss_chart(df):
         marker_color=colors
     ))
 
-    fig.update_layout(
-        title="Daily Gain/Loss by Stock",
-        xaxis_title="Stock",
-        yaxis_title="Gain/Loss",
-        template="plotly_white"
-    )
-
+    fig.update_layout(title="Daily Gain/Loss by Owned Stock", xaxis_title="Stock", yaxis_title="Gain/Loss", template="plotly_white")
     return fig.to_html(full_html=False, include_plotlyjs=False)
 
 
@@ -710,27 +812,70 @@ def create_total_gain_loss_chart(df):
         marker_color=colors
     ))
 
-    fig.update_layout(
-        title="Total Gain/Loss Compared to Average Cost",
-        xaxis_title="Stock",
-        yaxis_title="Total Gain/Loss",
-        template="plotly_white"
-    )
-
+    fig.update_layout(title="Total Gain/Loss Compared to Average Cost", xaxis_title="Stock", yaxis_title="Total Gain/Loss", template="plotly_white")
     return fig.to_html(full_html=False, include_plotlyjs=False)
 
 
 def create_allocation_chart(df):
-    fig = px.pie(
-        df,
-        names="Ticker",
-        values="Current Value",
-        title="Portfolio Allocation"
-    )
-
+    fig = px.pie(df, names="Ticker", values="Current Value", title="Portfolio Allocation")
     fig.update_traces(textposition="inside", textinfo="percent+label")
-
     fig.update_layout(template="plotly_white")
+    return fig.to_html(full_html=False, include_plotlyjs=False)
+
+
+def create_watchlist_movers_chart(watchlist_df):
+    if watchlist_df.empty:
+        return ""
+
+    sorted_df = watchlist_df.sort_values("Daily Change %", ascending=False).copy()
+    colors = ["green" if value >= 0 else "red" for value in sorted_df["Daily Change %"]]
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Bar(
+        x=sorted_df["Ticker"],
+        y=sorted_df["Daily Change %"],
+        text=[f"{value:.2f}%" for value in sorted_df["Daily Change %"]],
+        textposition="outside",
+        marker_color=colors
+    ))
+
+    fig.update_layout(title="Watchlist Daily Movers", xaxis_title="Ticker", yaxis_title="Daily Change %", template="plotly_white")
+    return fig.to_html(full_html=False, include_plotlyjs=False)
+
+
+def create_watchlist_rsi_chart(watchlist_df):
+    if watchlist_df.empty or "RSI" not in watchlist_df.columns:
+        return ""
+
+    clean_df = watchlist_df.dropna(subset=["RSI"]).copy()
+
+    if clean_df.empty:
+        return ""
+
+    colors = []
+
+    for value in clean_df["RSI"]:
+        if value >= 70:
+            colors.append("red")
+        elif value <= 30:
+            colors.append("green")
+        else:
+            colors.append("gray")
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Bar(
+        x=clean_df["Ticker"],
+        y=clean_df["RSI"],
+        text=[f"{value:.2f}" for value in clean_df["RSI"]],
+        textposition="outside",
+        marker_color=colors
+    ))
+
+    fig.add_hline(y=70, line_dash="dash", annotation_text="Overbought")
+    fig.add_hline(y=30, line_dash="dash", annotation_text="Oversold")
+    fig.update_layout(title="Watchlist RSI", xaxis_title="Ticker", yaxis_title="RSI", template="plotly_white")
 
     return fig.to_html(full_html=False, include_plotlyjs=False)
 
@@ -754,13 +899,7 @@ def create_normalized_performance_chart(tickers):
             name=ticker
         ))
 
-    fig.update_layout(
-        title="6-Month Normalized Performance",
-        xaxis_title="Date",
-        yaxis_title="Starting at 100",
-        template="plotly_white"
-    )
-
+    fig.update_layout(title="6-Month Normalized Performance", xaxis_title="Date", yaxis_title="Starting at 100", template="plotly_white")
     return fig.to_html(full_html=False, include_plotlyjs=False)
 
 
@@ -777,36 +916,11 @@ def create_moving_average_chart(tickers):
         history["SMA 20"] = history["Close"].rolling(window=20).mean()
         history["SMA 50"] = history["Close"].rolling(window=50).mean()
 
-        fig.add_trace(go.Scatter(
-            x=history.index,
-            y=history["Close"],
-            mode="lines",
-            name=f"{ticker} Price"
-        ))
+        fig.add_trace(go.Scatter(x=history.index, y=history["Close"], mode="lines", name=f"{ticker} Price"))
+        fig.add_trace(go.Scatter(x=history.index, y=history["SMA 20"], mode="lines", name=f"{ticker} 20D SMA", line=dict(dash="dash")))
+        fig.add_trace(go.Scatter(x=history.index, y=history["SMA 50"], mode="lines", name=f"{ticker} 50D SMA", line=dict(dash="dot")))
 
-        fig.add_trace(go.Scatter(
-            x=history.index,
-            y=history["SMA 20"],
-            mode="lines",
-            name=f"{ticker} 20D SMA",
-            line=dict(dash="dash")
-        ))
-
-        fig.add_trace(go.Scatter(
-            x=history.index,
-            y=history["SMA 50"],
-            mode="lines",
-            name=f"{ticker} 50D SMA",
-            line=dict(dash="dot")
-        ))
-
-    fig.update_layout(
-        title="Price With Moving Averages",
-        xaxis_title="Date",
-        yaxis_title="Price",
-        template="plotly_white"
-    )
-
+    fig.update_layout(title="Price With Moving Averages", xaxis_title="Date", yaxis_title="Price", template="plotly_white")
     return fig.to_html(full_html=False, include_plotlyjs=False)
 
 
@@ -815,20 +929,14 @@ def create_volatility_chart(df):
         df,
         x="Ticker",
         y="Annualized Volatility %",
-        title="Annualized Volatility",
+        title="Owned Stock Annualized Volatility",
         text="Annualized Volatility %",
         color="Annualized Volatility %",
         color_continuous_scale="Reds"
     )
 
     fig.update_traces(texttemplate="%{text:.2f}%", textposition="outside")
-
-    fig.update_layout(
-        xaxis_title="Stock",
-        yaxis_title="Volatility",
-        template="plotly_white",
-        showlegend=False
-    )
+    fig.update_layout(xaxis_title="Stock", yaxis_title="Volatility", template="plotly_white", showlegend=False)
 
     return fig.to_html(full_html=False, include_plotlyjs=False)
 
@@ -837,21 +945,27 @@ def create_volatility_chart(df):
 # AI SUMMARY
 # ============================================================
 
-def generate_ai_summary(df, news_items):
-    total_value = df["Current Value"].sum()
-    previous_value = df["Previous Value"].sum()
-    total_daily_gain_loss = df["Daily Gain/Loss"].sum()
+def generate_ai_summary(portfolio_df, watchlist_df, portfolio_news, watchlist_news):
+    total_value = portfolio_df["Current Value"].sum()
+    previous_value = portfolio_df["Previous Value"].sum()
+    total_daily_gain_loss = portfolio_df["Daily Gain/Loss"].sum()
     total_daily_percent = (total_daily_gain_loss / previous_value) * 100 if previous_value != 0 else 0
 
-    total_cost_basis = df["Cost Basis"].sum()
-    total_unrealized_gain_loss = df["Total Gain/Loss"].sum()
+    total_cost_basis = portfolio_df["Cost Basis"].sum()
+    total_unrealized_gain_loss = portfolio_df["Total Gain/Loss"].sum()
     total_unrealized_percent = (total_unrealized_gain_loss / total_cost_basis) * 100 if total_cost_basis > 0 else 0
 
-    best_stock = df.loc[df["Daily Gain/Loss"].idxmax()]
-    worst_stock = df.loc[df["Daily Gain/Loss"].idxmin()]
-    largest_position = df.loc[df["Portfolio Weight %"].idxmax()]
+    best_stock = portfolio_df.loc[portfolio_df["Daily Gain/Loss"].idxmax()]
+    worst_stock = portfolio_df.loc[portfolio_df["Daily Gain/Loss"].idxmin()]
+    largest_position = portfolio_df.loc[portfolio_df["Portfolio Weight %"].idxmax()]
 
-    news_text = news_items_to_text(news_items)
+    if watchlist_df.empty:
+        watchlist_text = "No watchlist stocks found."
+    else:
+        watchlist_text = watchlist_df.to_string(index=False)
+
+    portfolio_news_text = news_items_to_text(portfolio_news, max_items=8)
+    watchlist_news_text = news_items_to_text(watchlist_news, max_items=8)
 
     prompt = f"""
 You are an AI financial dashboard assistant.
@@ -860,41 +974,50 @@ Formatting rules:
 Do not use markdown.
 Do not use asterisks.
 Do not use hashtags.
-Do not use code blocks.
 Use plain sentences only.
 Keep every point short.
 Do not give official financial advice.
 
 Portfolio data:
-{df.to_string(index=False)}
+{portfolio_df.to_string(index=False)}
 
-Recent stock news:
-{news_text}
+Watchlist data:
+{watchlist_text}
+
+Recent portfolio news:
+{portfolio_news_text}
+
+Recent watchlist news:
+{watchlist_news_text}
 
 Write this exact structure:
 
 Portfolio Summary:
 - Explain today's total portfolio movement.
-- Mention the total portfolio value.
+- Mention total portfolio value.
 - Mention daily gain or loss.
 
 Best Performer:
-- Explain which stock helped the most today and why.
+- Explain which owned stock helped the most today.
 
 Worst Performer:
-- Explain which stock hurt the most today and why.
+- Explain which owned stock hurt the most today.
 
 Total Gain or Loss:
-- Explain the total gain or loss compared to average cost.
+- Explain total gain or loss compared to average cost.
 
 Risk and Trend Notes:
 - Mention RSI, moving averages, volatility, and allocation.
 - Mention if the portfolio depends heavily on one stock.
 
+Watchlist Summary:
+- Explain the strongest watchlist movers.
+- Mention which watchlist stocks look worth researching based on trend, RSI, and daily movement.
+
 Market and Stock News:
-- Summarize the most important news items.
-- Explain which news may matter to the portfolio.
-- If the news is not clearly connected to a price move, say that clearly.
+- Summarize important portfolio and watchlist news.
+- Explain which news may matter.
+- If the news is not clearly connected to price movement, say that clearly.
 
 Beginner Takeaway:
 - Give one simple takeaway.
@@ -906,7 +1029,7 @@ Beginner Takeaway:
             input=prompt,
             text=True,
             capture_output=True,
-            timeout=120
+            timeout=140
         )
 
         if result.returncode == 0 and result.stdout.strip():
@@ -921,10 +1044,10 @@ Your portfolio is worth {format_money(total_value)}.
 Your daily gain or loss is {get_sign(total_daily_gain_loss)}{format_money(total_daily_gain_loss)}, which is {get_sign(total_daily_percent)}{format_percent(total_daily_percent)} today.
 
 Best Performer:
-The best performer today is {best_stock["Ticker"]}, with a daily impact of {format_money(best_stock["Daily Gain/Loss"])}.
+The best owned stock today is {best_stock["Ticker"]}, with a daily impact of {format_money(best_stock["Daily Gain/Loss"])}.
 
 Worst Performer:
-The worst performer today is {worst_stock["Ticker"]}, with a daily impact of {format_money(worst_stock["Daily Gain/Loss"])}.
+The weakest owned stock today is {worst_stock["Ticker"]}, with a daily impact of {format_money(worst_stock["Daily Gain/Loss"])}.
 
 Total Gain or Loss:
 Your total gain or loss compared to average cost is {get_sign(total_unrealized_gain_loss)}{format_money(total_unrealized_gain_loss)}, which is {get_sign(total_unrealized_percent)}{format_percent(total_unrealized_percent)}.
@@ -933,12 +1056,15 @@ Risk and Trend Notes:
 Your largest position is {largest_position["Ticker"]}, which is {format_percent(largest_position["Portfolio Weight %"])} of your portfolio.
 Watch allocation, moving averages, RSI, volatility, and whether too much of the portfolio depends on one stock.
 
+Watchlist Summary:
+Use the watchlist table to compare RSI, trend signals, volatility, daily movement, and research signals.
+
 Market and Stock News:
-The dashboard found {len(news_items)} recent stock news items from yfinance.
-Read the news cards below to see what may have affected your holdings.
+The dashboard found {len(portfolio_news)} portfolio news items and {len(watchlist_news)} watchlist news items.
+Read the news cards below to see what may affect your stocks.
 
 Beginner Takeaway:
-Do not only look at daily gains and losses. Also watch news, long-term trend, risk, and portfolio concentration.
+Separate stocks you own from stocks you are researching. That makes your decisions more organized.
 """
 
     return clean_ai_text(backup)
@@ -948,15 +1074,23 @@ Do not only look at daily gains and losses. Also watch news, long-term trend, ri
 # HTML REPORT
 # ============================================================
 
-def create_moving_ticker(df):
+def create_moving_ticker(portfolio_df, watchlist_df):
     ticker_items = ""
+    combined = []
 
-    for _, row in df.iterrows():
+    for _, row in portfolio_df.iterrows():
+        combined.append((row, "Owned"))
+
+    for _, row in watchlist_df.iterrows():
+        combined.append((row, "Watchlist"))
+
+    for row, label in combined:
         change_class = get_positive_negative_class(row["Daily Change %"])
         sign = get_sign(row["Daily Change %"])
 
         ticker_items += f"""
         <div class="ticker-item">
+            <div class="ticker-label">{label}</div>
             <div class="ticker-symbol">{escape(str(row["Ticker"]))}</div>
             <div class="ticker-company">{escape(str(row["Company"]))}</div>
             <div class="ticker-price">{format_money(row["Current Price"])}</div>
@@ -967,7 +1101,7 @@ def create_moving_ticker(df):
     return ticker_items + ticker_items
 
 
-def create_table_html(df):
+def create_portfolio_table_html(df):
     rows = ""
 
     for _, row in df.iterrows():
@@ -1038,36 +1172,127 @@ def create_table_html(df):
     """
 
 
-def create_html_report(df, ai_summary, news_items):
+def create_watchlist_table_html(df):
+    if df.empty:
+        return "<p>No watchlist stocks found.</p>"
+
+    rows = ""
+
+    for _, row in df.iterrows():
+        daily_class = get_positive_negative_class(row["Daily Change %"])
+        five_day_class = get_positive_negative_class(row["5D Return %"])
+        one_month_class = get_positive_negative_class(row["1M Return %"])
+        three_month_class = get_positive_negative_class(row["3M Return %"])
+
+        rows += f"""
+        <tr>
+            <td><strong>{escape(str(row["Ticker"]))}</strong></td>
+            <td>{escape(str(row["Company"]))}</td>
+            <td>{format_money(row["Current Price"])}</td>
+            <td class="{daily_class}">{get_sign(row["Daily Change %"])}{format_percent(row["Daily Change %"])}</td>
+            <td class="{five_day_class}">{get_sign(row["5D Return %"])}{format_percent(row["5D Return %"])}</td>
+            <td class="{one_month_class}">{get_sign(row["1M Return %"])}{format_percent(row["1M Return %"])}</td>
+            <td class="{three_month_class}">{get_sign(row["3M Return %"])}{format_percent(row["3M Return %"])}</td>
+            <td>{row["RSI"] if pd.notna(row["RSI"]) else "N/A"}</td>
+            <td>{escape(str(row["RSI Signal"]))}</td>
+            <td>{escape(str(row["Trend Signal"]))}</td>
+            <td>{format_percent(row["Annualized Volatility %"])}</td>
+            <td>{format_money(row["52W High"])}</td>
+            <td>{format_money(row["52W Low"])}</td>
+            <td>{format_percent(row["Distance From 52W High %"])}</td>
+            <td>{format_large_number(row["Market Cap"])}</td>
+            <td><strong>{escape(str(row["Research Signal"]))}</strong></td>
+        </tr>
+        """
+
+    return f"""
+    <table class="portfolio-table">
+        <thead>
+            <tr>
+                <th>Ticker</th>
+                <th>Company</th>
+                <th>Price</th>
+                <th>Daily %</th>
+                <th>5D</th>
+                <th>1M</th>
+                <th>3M</th>
+                <th>RSI</th>
+                <th>RSI Signal</th>
+                <th>Trend</th>
+                <th>Volatility</th>
+                <th>52W High</th>
+                <th>52W Low</th>
+                <th>From 52W High</th>
+                <th>Market Cap</th>
+                <th>Research Signal</th>
+            </tr>
+        </thead>
+        <tbody>
+            {rows}
+        </tbody>
+    </table>
+    """
+
+
+def create_html_report(portfolio_df, watchlist_df, ai_summary, portfolio_news, watchlist_news):
     REPORTS_FOLDER.mkdir(exist_ok=True)
 
-    tickers = df["Ticker"].tolist()
+    portfolio_tickers = portfolio_df["Ticker"].tolist()
+    watchlist_tickers = watchlist_df["Ticker"].tolist() if not watchlist_df.empty else []
+    all_tickers = list(dict.fromkeys(portfolio_tickers + watchlist_tickers))
 
-    total_value = df["Current Value"].sum()
-    previous_value = df["Previous Value"].sum()
-    total_daily_gain_loss = df["Daily Gain/Loss"].sum()
+    total_value = portfolio_df["Current Value"].sum()
+    previous_value = portfolio_df["Previous Value"].sum()
+    total_daily_gain_loss = portfolio_df["Daily Gain/Loss"].sum()
     total_daily_percent = (total_daily_gain_loss / previous_value) * 100 if previous_value != 0 else 0
 
-    total_cost_basis = df["Cost Basis"].sum()
-    total_gain_loss = df["Total Gain/Loss"].sum()
+    total_cost_basis = portfolio_df["Cost Basis"].sum()
+    total_gain_loss = portfolio_df["Total Gain/Loss"].sum()
     total_gain_loss_percent = (total_gain_loss / total_cost_basis) * 100 if total_cost_basis > 0 else 0
 
-    best_stock = df.loc[df["Daily Gain/Loss"].idxmax()]
-    worst_stock = df.loc[df["Daily Gain/Loss"].idxmin()]
-    largest_position = df.loc[df["Portfolio Weight %"].idxmax()]
+    best_stock = portfolio_df.loc[portfolio_df["Daily Gain/Loss"].idxmax()]
+    worst_stock = portfolio_df.loc[portfolio_df["Daily Gain/Loss"].idxmin()]
+    largest_position = portfolio_df.loc[portfolio_df["Portfolio Weight %"].idxmax()]
 
-    ticker_html = create_moving_ticker(df)
-    table_html = create_table_html(df)
+    if not watchlist_df.empty:
+        top_watchlist = watchlist_df.loc[watchlist_df["Daily Change %"].idxmax()]
+        weak_watchlist = watchlist_df.loc[watchlist_df["Daily Change %"].idxmin()]
+        strong_watch_count = len(watchlist_df[watchlist_df["Research Signal"].isin(["Strong watch", "Worth watching"])])
+    else:
+        top_watchlist = None
+        weak_watchlist = None
+        strong_watch_count = 0
+
+    top_watchlist_card = "N/A"
+    top_watchlist_note = "No watchlist data available."
+    weak_watchlist_card = "N/A"
+    weak_watchlist_note = "No watchlist data available."
+
+    if top_watchlist is not None:
+        top_watchlist_card = escape(str(top_watchlist["Ticker"]))
+        top_watchlist_note = f'{get_sign(top_watchlist["Daily Change %"])}{format_percent(top_watchlist["Daily Change %"])} today'
+
+    if weak_watchlist is not None:
+        weak_watchlist_card = escape(str(weak_watchlist["Ticker"]))
+        weak_watchlist_note = f'{get_sign(weak_watchlist["Daily Change %"])}{format_percent(weak_watchlist["Daily Change %"])} today'
+
+    ticker_html = create_moving_ticker(portfolio_df, watchlist_df)
+    portfolio_table_html = create_portfolio_table_html(portfolio_df)
+    watchlist_table_html = create_watchlist_table_html(watchlist_df)
     ai_summary_html = format_ai_summary_as_html(ai_summary)
-    news_html = create_news_html(news_items)
 
-    portfolio_value_chart = create_portfolio_value_chart(df)
-    daily_gain_loss_chart = create_daily_gain_loss_chart(df)
-    total_gain_loss_chart = create_total_gain_loss_chart(df)
-    allocation_chart = create_allocation_chart(df)
-    normalized_chart = create_normalized_performance_chart(tickers)
-    moving_average_chart = create_moving_average_chart(tickers)
-    volatility_chart = create_volatility_chart(df)
+    portfolio_news_html = create_news_html(portfolio_news)
+    watchlist_news_html = create_news_html(watchlist_news)
+
+    portfolio_value_chart = create_portfolio_value_chart(portfolio_df)
+    daily_gain_loss_chart = create_daily_gain_loss_chart(portfolio_df)
+    total_gain_loss_chart = create_total_gain_loss_chart(portfolio_df)
+    allocation_chart = create_allocation_chart(portfolio_df)
+    watchlist_movers_chart = create_watchlist_movers_chart(watchlist_df)
+    watchlist_rsi_chart = create_watchlist_rsi_chart(watchlist_df)
+    normalized_chart = create_normalized_performance_chart(all_tickers)
+    moving_average_chart = create_moving_average_chart(all_tickers)
+    volatility_chart = create_volatility_chart(portfolio_df)
 
     html = f"""
 <!DOCTYPE html>
@@ -1086,7 +1311,7 @@ def create_html_report(df, ai_summary, news_items):
         }}
 
         .container {{
-            max-width: 1300px;
+            max-width: 1350px;
             margin: auto;
             padding: 30px;
         }}
@@ -1115,7 +1340,7 @@ def create_html_report(df, ai_summary, news_items):
             display: flex;
             gap: 15px;
             width: max-content;
-            animation: tickerMove 25s linear infinite;
+            animation: tickerMove 32s linear infinite;
         }}
 
         .ticker-wrapper:hover .ticker-track {{
@@ -1132,13 +1357,23 @@ def create_html_report(df, ai_summary, news_items):
         }}
 
         .ticker-item {{
-            min-width: 180px;
+            min-width: 185px;
             background: #1f2937;
             color: white;
             padding: 14px;
             border-radius: 14px;
             text-align: center;
             flex-shrink: 0;
+        }}
+
+        .ticker-label {{
+            display: inline-block;
+            font-size: 11px;
+            background: #374151;
+            color: #e5e7eb;
+            padding: 3px 8px;
+            border-radius: 999px;
+            margin-bottom: 6px;
         }}
 
         .ticker-symbol {{
@@ -1337,7 +1572,7 @@ def create_html_report(df, ai_summary, news_items):
             <div class="card">
                 <h2>Total Portfolio Value</h2>
                 <div class="value">{format_money(total_value)}</div>
-                <div class="small-note">Current value of your holdings</div>
+                <div class="small-note">Current value of your owned holdings</div>
             </div>
 
             <div class="card">
@@ -1357,13 +1592,13 @@ def create_html_report(df, ai_summary, news_items):
             </div>
 
             <div class="card">
-                <h2>Best Performer</h2>
+                <h2>Best Owned Stock</h2>
                 <div class="value positive">{escape(str(best_stock["Ticker"]))}</div>
                 <div class="small-note">{format_money(best_stock["Daily Gain/Loss"])} today</div>
             </div>
 
             <div class="card">
-                <h2>Worst Performer</h2>
+                <h2>Worst Owned Stock</h2>
                 <div class="value negative">{escape(str(worst_stock["Ticker"]))}</div>
                 <div class="small-note">{format_money(worst_stock["Daily Gain/Loss"])} today</div>
             </div>
@@ -1373,23 +1608,59 @@ def create_html_report(df, ai_summary, news_items):
                 <div class="value">{escape(str(largest_position["Ticker"]))}</div>
                 <div class="small-note">{format_percent(largest_position["Portfolio Weight %"])} of portfolio</div>
             </div>
+
+            <div class="card">
+                <h2>Top Watchlist Mover</h2>
+                <div class="value positive">{top_watchlist_card}</div>
+                <div class="small-note">{top_watchlist_note}</div>
+            </div>
+
+            <div class="card">
+                <h2>Weakest Watchlist Mover</h2>
+                <div class="value negative">{weak_watchlist_card}</div>
+                <div class="small-note">{weak_watchlist_note}</div>
+            </div>
+
+            <div class="card">
+                <h2>Research Signals</h2>
+                <div class="value">{strong_watch_count}</div>
+                <div class="small-note">watchlist stocks marked strong or worth watching</div>
+            </div>
         </div>
 
         <div class="section">
-            <h2>AI Portfolio Summary</h2>
+            <h2>AI Portfolio and Watchlist Summary</h2>
             <div class="ai-summary">
                 {ai_summary_html}
             </div>
         </div>
 
         <div class="section">
-            <h2>Recent Stock News</h2>
-            {news_html}
+            <h2>Watchlist Metrics Table</h2>
+            {watchlist_table_html}
+        </div>
+
+        <div class="section">
+            {watchlist_movers_chart}
+        </div>
+
+        <div class="section">
+            {watchlist_rsi_chart}
+        </div>
+
+        <div class="section">
+            <h2>Watchlist News</h2>
+            {watchlist_news_html}
         </div>
 
         <div class="section">
             <h2>Portfolio Metrics Table</h2>
-            {table_html}
+            {portfolio_table_html}
+        </div>
+
+        <div class="section">
+            <h2>Portfolio News</h2>
+            {portfolio_news_html}
         </div>
 
         <div class="section">
@@ -1421,7 +1692,7 @@ def create_html_report(df, ai_summary, news_items):
         </div>
 
         <p class="footer">
-            Portfolio is entered in the Terminal. This dashboard is display only. Data and news are latest available from yfinance and are not professional tick-by-tick trading data. This is not financial advice.
+            Portfolio stocks are stocks you own. Watchlist stocks are stocks you are researching. Data and news are latest available from yfinance and are not professional tick-by-tick trading data. This is not financial advice.
         </p>
     </div>
 </body>
@@ -1452,32 +1723,48 @@ def main():
     portfolio_input = load_portfolio()
     print("Portfolio input loaded.")
 
-    df = build_portfolio_dataframe(portfolio_input)
+    watchlist_input = load_watchlist()
+    print("Watchlist input loaded.")
 
-    if df.empty:
-        print("No stock data found. Check your tickers or internet connection.")
+    portfolio_df = build_portfolio_dataframe(portfolio_input)
+
+    if portfolio_df.empty:
+        print("No stock data found. Check your portfolio tickers or internet connection.")
         return
 
     print("Portfolio data loaded.")
-    print(df)
+    print(portfolio_df)
 
-    tickers = df["Ticker"].tolist()
+    watchlist_df = build_watchlist_dataframe(watchlist_input)
 
-    print("Gathering recent stock news...")
-    news_items = get_stock_news(tickers)
-    print(f"Found {len(news_items)} news items.")
+    if watchlist_df.empty:
+        print("No watchlist data found. Continuing with portfolio only.")
+    else:
+        print("Watchlist data loaded.")
+        print(watchlist_df)
 
-    ai_summary = generate_ai_summary(df, news_items)
+    portfolio_tickers = portfolio_df["Ticker"].tolist()
+    watchlist_tickers = watchlist_df["Ticker"].tolist() if not watchlist_df.empty else []
+
+    print("Gathering recent portfolio news...")
+    portfolio_news = get_stock_news(portfolio_tickers)
+    print(f"Found {len(portfolio_news)} portfolio news items.")
+
+    print("Gathering recent watchlist news...")
+    watchlist_news = get_stock_news(watchlist_tickers)
+    print(f"Found {len(watchlist_news)} watchlist news items.")
+
+    ai_summary = generate_ai_summary(portfolio_df, watchlist_df, portfolio_news, watchlist_news)
     print("AI summary created.")
 
-    report_path = create_html_report(df, ai_summary, news_items)
+    report_path = create_html_report(portfolio_df, watchlist_df, ai_summary, portfolio_news, watchlist_news)
     print(f"Report saved to: {report_path}")
 
     open_report(report_path)
 
     send_mac_notification(
         "AI Financial Dashboard",
-        "Your financial dashboard with news is ready."
+        "Your dashboard with portfolio and watchlist is ready."
     )
 
 
