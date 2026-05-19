@@ -15,12 +15,7 @@ else
 fi
 
 echo ""
-echo "Checking Python..."
-which python3
-python3 --version
-
-echo ""
-echo "Running main.py..."
+echo "Running dashboard manually..."
 python3 main.py
 
 echo ""
