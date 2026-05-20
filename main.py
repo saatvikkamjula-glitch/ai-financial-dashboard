@@ -239,6 +239,8 @@ def format_ai_summary_as_html(text):
         "worst performer",
         "total gain or loss",
         "risk and trend notes",
+        "benchmark comparison",
+        "portfolio vs market",
         "watchlist summary",
         "watchlist movers",
         "market and stock news",
@@ -923,6 +925,202 @@ def news_items_to_text(news_items, max_items=10):
 
 
 # ============================================================
+# BENCHMARK FUNCTIONS
+# ============================================================
+
+def get_price_history(ticker, period="6mo"):
+    try:
+        stock = yf.Ticker(ticker)
+        history = stock.history(period=period, interval="1d")
+
+        if history.empty:
+            return pd.Series(dtype=float)
+
+        return history["Close"].dropna()
+    except Exception as error:
+        print(f"Could not get price history for {ticker}: {error}")
+        return pd.Series(dtype=float)
+
+
+def build_portfolio_value_history(portfolio_input):
+    portfolio_series = None
+
+    for _, row in portfolio_input.iterrows():
+        ticker = row["Ticker"]
+        shares = float(row["Shares"])
+
+        prices = get_price_history(ticker)
+
+        if prices.empty:
+            continue
+
+        value_series = prices * shares
+
+        if portfolio_series is None:
+            portfolio_series = value_series
+        else:
+            portfolio_series = portfolio_series.add(value_series, fill_value=0)
+
+    if portfolio_series is None or portfolio_series.empty:
+        return pd.Series(dtype=float)
+
+    return portfolio_series.dropna()
+
+
+def calculate_return_from_series(series, days):
+    if series is None or series.empty or len(series) <= 1:
+        return None
+
+    current = series.iloc[-1]
+
+    if days == "full":
+        past = series.iloc[0]
+    else:
+        if len(series) <= days:
+            past = series.iloc[0]
+        else:
+            past = series.iloc[-days]
+
+    if past == 0:
+        return None
+
+    return safe_float(((current - past) / past) * 100)
+
+
+def get_benchmark_summary(portfolio_input):
+    portfolio_series = build_portfolio_value_history(portfolio_input)
+    spy_series = get_price_history("SPY")
+    qqq_series = get_price_history("QQQ")
+
+    rows = []
+
+    benchmark_items = [
+        ("Portfolio", portfolio_series),
+        ("SPY", spy_series),
+        ("QQQ", qqq_series),
+    ]
+
+    for name, series in benchmark_items:
+        rows.append({
+            "Asset": name,
+            "Daily %": calculate_return_from_series(series, 2),
+            "1M %": calculate_return_from_series(series, 21),
+            "3M %": calculate_return_from_series(series, 63),
+            "6M %": calculate_return_from_series(series, "full"),
+        })
+
+    df = pd.DataFrame(rows)
+
+    for column in ["Daily %", "1M %", "3M %", "6M %"]:
+        df[column] = df[column].apply(lambda value: round(value, 2) if value is not None else None)
+
+    return df, portfolio_series, spy_series, qqq_series
+
+
+def get_benchmark_verdict(benchmark_df):
+    try:
+        portfolio_daily = benchmark_df.loc[benchmark_df["Asset"] == "Portfolio", "Daily %"].iloc[0]
+        spy_daily = benchmark_df.loc[benchmark_df["Asset"] == "SPY", "Daily %"].iloc[0]
+        qqq_daily = benchmark_df.loc[benchmark_df["Asset"] == "QQQ", "Daily %"].iloc[0]
+
+        if pd.isna(portfolio_daily) or pd.isna(spy_daily) or pd.isna(qqq_daily):
+            return "Not enough benchmark data yet."
+
+        beat_spy = portfolio_daily > spy_daily
+        beat_qqq = portfolio_daily > qqq_daily
+
+        if beat_spy and beat_qqq:
+            return "Your portfolio outperformed both SPY and QQQ today."
+
+        if beat_spy and not beat_qqq:
+            return "Your portfolio beat SPY today but lagged QQQ."
+
+        if not beat_spy and beat_qqq:
+            return "Your portfolio beat QQQ today but lagged SPY."
+
+        return "Your portfolio lagged both SPY and QQQ today."
+    except Exception:
+        return "Not enough benchmark data yet."
+
+
+def create_benchmark_table_html(benchmark_df):
+    rows = ""
+
+    for _, row in benchmark_df.iterrows():
+        rows += f"""
+        <tr>
+            <td><strong>{escape(str(row["Asset"]))}</strong></td>
+            <td class="{get_positive_negative_class(row["Daily %"])}">{get_sign(row["Daily %"])}{format_percent(row["Daily %"])}</td>
+            <td class="{get_positive_negative_class(row["1M %"])}">{get_sign(row["1M %"])}{format_percent(row["1M %"])}</td>
+            <td class="{get_positive_negative_class(row["3M %"])}">{get_sign(row["3M %"])}{format_percent(row["3M %"])}</td>
+            <td class="{get_positive_negative_class(row["6M %"])}">{get_sign(row["6M %"])}{format_percent(row["6M %"])}</td>
+        </tr>
+        """
+
+    return f"""
+    <table class="benchmark-table">
+        <thead>
+            <tr>
+                <th>Asset</th>
+                <th>Daily</th>
+                <th>1M</th>
+                <th>3M</th>
+                <th>6M</th>
+            </tr>
+        </thead>
+        <tbody>
+            {rows}
+        </tbody>
+    </table>
+    """
+
+
+def normalize_series(series):
+    if series is None or series.empty:
+        return pd.Series(dtype=float)
+
+    first_value = series.iloc[0]
+
+    if first_value == 0:
+        return pd.Series(dtype=float)
+
+    return (series / first_value) * 100
+
+
+def create_benchmark_chart(portfolio_series, spy_series, qqq_series):
+    fig = go.Figure()
+
+    items = [
+        ("Portfolio", portfolio_series),
+        ("SPY", spy_series),
+        ("QQQ", qqq_series),
+    ]
+
+    for name, series in items:
+        normalized = normalize_series(series)
+
+        if normalized.empty:
+            continue
+
+        fig.add_trace(go.Scatter(
+            x=normalized.index,
+            y=normalized.values,
+            mode="lines",
+            name=name
+        ))
+
+    fig.update_layout(
+        title="Portfolio vs SPY vs QQQ",
+        xaxis_title="Date",
+        yaxis_title="Starting at 100",
+        template="plotly_white",
+        legend_title="Benchmark"
+    )
+
+    return fig.to_html(full_html=False, include_plotlyjs="cdn")
+
+
+# ============================================================
 # CHARTS
 # ============================================================
 
@@ -1081,39 +1279,6 @@ def create_watchlist_rsi_chart(watchlist_df):
     return fig.to_html(full_html=False, include_plotlyjs="cdn")
 
 
-def create_normalized_performance_chart(tickers):
-    fig = go.Figure()
-
-    for ticker in tickers:
-        data = get_stock_data(ticker)
-
-        if data is None:
-            continue
-
-        history = data["history"]
-
-        if history.empty:
-            continue
-
-        normalized = history["Close"] / history["Close"].iloc[0] * 100
-
-        fig.add_trace(go.Scatter(
-            x=history.index,
-            y=normalized,
-            mode="lines",
-            name=ticker
-        ))
-
-    fig.update_layout(
-        title="6-Month Normalized Performance",
-        xaxis_title="Date",
-        yaxis_title="Starting at 100",
-        template="plotly_white"
-    )
-
-    return fig.to_html(full_html=False, include_plotlyjs="cdn")
-
-
 def create_moving_average_chart(tickers):
     fig = go.Figure()
 
@@ -1191,7 +1356,7 @@ def create_volatility_chart(df):
 # AI SUMMARY
 # ============================================================
 
-def generate_ai_summary(portfolio_df, watchlist_df, portfolio_news, watchlist_news):
+def generate_ai_summary(portfolio_df, watchlist_df, portfolio_news, watchlist_news, benchmark_df, benchmark_verdict):
     total_value = portfolio_df["Current Value"].sum()
     previous_value = portfolio_df["Previous Value"].sum()
     total_daily_gain_loss = portfolio_df["Daily Gain/Loss"].sum()
@@ -1212,6 +1377,7 @@ def generate_ai_summary(portfolio_df, watchlist_df, portfolio_news, watchlist_ne
 
     portfolio_news_text = news_items_to_text(portfolio_news, max_items=8)
     watchlist_news_text = news_items_to_text(watchlist_news, max_items=8)
+    benchmark_text = benchmark_df.to_string(index=False)
 
     prompt = f"""
 You are an AI financial dashboard assistant.
@@ -1229,6 +1395,12 @@ Portfolio data:
 
 Watchlist data:
 {watchlist_text}
+
+Benchmark data:
+{benchmark_text}
+
+Benchmark result:
+{benchmark_verdict}
 
 Recent portfolio news:
 {portfolio_news_text}
@@ -1251,6 +1423,10 @@ Worst Performer:
 
 Total Gain or Loss:
 - Explain total gain or loss compared to average cost.
+
+Portfolio vs Market:
+- Explain whether the portfolio beat or lagged SPY and QQQ today.
+- Keep it simple.
 
 Risk and Trend Notes:
 - Mention RSI, moving averages, volatility, and allocation.
@@ -1298,6 +1474,9 @@ The weakest owned stock today is {worst_stock["Ticker"]}, with a daily impact of
 Total Gain or Loss:
 Your total gain or loss compared to average cost is {get_sign(total_unrealized_gain_loss)}{format_money(total_unrealized_gain_loss)}, which is {get_sign(total_unrealized_percent)}{format_percent(total_unrealized_percent)}.
 
+Portfolio vs Market:
+{benchmark_verdict}
+
 Risk and Trend Notes:
 Your largest position is {largest_position["Ticker"]}, which is {format_percent(largest_position["Portfolio Weight %"])} of your portfolio.
 Watch allocation, moving averages, RSI, volatility, and whether too much of the portfolio depends on one stock.
@@ -1310,7 +1489,7 @@ The dashboard found {len(portfolio_news)} portfolio news items and {len(watchlis
 Read the news cards below to see what may affect your stocks.
 
 Beginner Takeaway:
-Separate stocks you own from stocks you are researching. That makes your decisions more organized.
+Separate stocks you own from stocks you are researching, and compare your portfolio against benchmarks like SPY and QQQ.
 """
 
     return clean_ai_text(backup)
@@ -1480,12 +1659,8 @@ def create_watchlist_table_html(df):
     """
 
 
-def create_html_report(portfolio_df, watchlist_df, ai_summary, portfolio_news, watchlist_news):
+def create_html_report(portfolio_input, portfolio_df, watchlist_df, ai_summary, portfolio_news, watchlist_news, benchmark_df, benchmark_verdict, benchmark_chart):
     REPORTS_FOLDER.mkdir(exist_ok=True)
-
-    portfolio_tickers = portfolio_df["Ticker"].tolist()
-    watchlist_tickers = watchlist_df["Ticker"].tolist() if not watchlist_df.empty else []
-    all_tickers = list(dict.fromkeys(portfolio_tickers + watchlist_tickers))
 
     total_value = portfolio_df["Current Value"].sum()
     previous_value = portfolio_df["Previous Value"].sum()
@@ -1498,37 +1673,20 @@ def create_html_report(portfolio_df, watchlist_df, ai_summary, portfolio_news, w
 
     best_stock = portfolio_df.loc[portfolio_df["Daily Gain/Loss"].idxmax()]
     worst_stock = portfolio_df.loc[portfolio_df["Daily Gain/Loss"].idxmin()]
-    largest_position = portfolio_df.loc[portfolio_df["Portfolio Weight %"].idxmax()]
 
-    if not watchlist_df.empty:
-        top_watchlist = watchlist_df.loc[watchlist_df["Daily Change %"].idxmax()]
-        weak_watchlist = watchlist_df.loc[watchlist_df["Daily Change %"].idxmin()]
-        strong_watch_count = len(watchlist_df[watchlist_df["Research Signal"].isin(["Strong watch", "Worth watching"])])
-    else:
-        top_watchlist = None
-        weak_watchlist = None
-        strong_watch_count = 0
+    portfolio_tickers = portfolio_df["Ticker"].tolist()
+    watchlist_tickers = watchlist_df["Ticker"].tolist() if not watchlist_df.empty else []
+    all_tickers = list(dict.fromkeys(portfolio_tickers + watchlist_tickers))
 
-    top_watchlist_card = "N/A"
-    top_watchlist_note = "No watchlist data available."
-    weak_watchlist_card = "N/A"
-    weak_watchlist_note = "No watchlist data available."
-
-    if top_watchlist is not None:
-        top_watchlist_card = escape(str(top_watchlist["Ticker"]))
-        top_watchlist_note = f'{get_sign(top_watchlist["Daily Change %"])}{format_percent(top_watchlist["Daily Change %"])} today'
-
-    if weak_watchlist is not None:
-        weak_watchlist_card = escape(str(weak_watchlist["Ticker"]))
-        weak_watchlist_note = f'{get_sign(weak_watchlist["Daily Change %"])}{format_percent(weak_watchlist["Daily Change %"])} today'
+    dashboard_alerts = build_dashboard_alerts(portfolio_df, watchlist_df)
+    alert_count = len(dashboard_alerts)
 
     ticker_html = create_moving_ticker(portfolio_df, watchlist_df)
     portfolio_table_html = create_portfolio_table_html(portfolio_df)
     watchlist_table_html = create_watchlist_table_html(watchlist_df)
     ai_summary_html = format_ai_summary_as_html(ai_summary)
-
-    dashboard_alerts = build_dashboard_alerts(portfolio_df, watchlist_df)
     alerts_html = create_alert_cards_html(dashboard_alerts)
+    benchmark_table_html = create_benchmark_table_html(benchmark_df)
 
     portfolio_news_html = create_news_html(portfolio_news)
     watchlist_news_html = create_news_html(watchlist_news)
@@ -1544,9 +1702,12 @@ def create_html_report(portfolio_df, watchlist_df, ai_summary, portfolio_news, w
     watchlist_movers_section = wrap_section(watchlist_movers_chart)
     watchlist_rsi_section = wrap_section(watchlist_rsi_chart)
 
-    normalized_chart = create_normalized_performance_chart(all_tickers)
     moving_average_chart = create_moving_average_chart(all_tickers)
     volatility_chart = create_volatility_chart(portfolio_df)
+
+    portfolio_daily = benchmark_df.loc[benchmark_df["Asset"] == "Portfolio", "Daily %"].iloc[0]
+    spy_daily = benchmark_df.loc[benchmark_df["Asset"] == "SPY", "Daily %"].iloc[0]
+    qqq_daily = benchmark_df.loc[benchmark_df["Asset"] == "QQQ", "Daily %"].iloc[0]
 
     html = f"""
 <!DOCTYPE html>
@@ -1648,10 +1809,10 @@ def create_html_report(portfolio_df, watchlist_df, ai_summary, portfolio_news, w
             margin-top: 6px;
         }}
 
-        .cards {{
+        .snapshot-cards {{
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-            gap: 20px;
+            grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+            gap: 18px;
             margin-bottom: 30px;
         }}
 
@@ -1698,6 +1859,13 @@ def create_html_report(portfolio_df, watchlist_df, ai_summary, portfolio_news, w
             overflow-x: auto;
         }}
 
+        .section-intro {{
+            color: #666;
+            margin-top: -5px;
+            margin-bottom: 18px;
+            line-height: 1.5;
+        }}
+
         .ai-summary {{
             line-height: 1.6;
             background: #f9fafb;
@@ -1726,27 +1894,75 @@ def create_html_report(portfolio_df, watchlist_df, ai_summary, portfolio_news, w
             margin-bottom: 8px;
         }}
 
-        .portfolio-table {{
+        .portfolio-table,
+        .benchmark-table {{
             width: 100%;
             border-collapse: collapse;
             font-size: 13px;
         }}
 
         .portfolio-table th,
-        .portfolio-table td {{
+        .portfolio-table td,
+        .benchmark-table th,
+        .benchmark-table td {{
             border: 1px solid #ddd;
             padding: 9px;
             text-align: center;
             white-space: nowrap;
         }}
 
-        .portfolio-table th {{
+        .portfolio-table th,
+        .benchmark-table th {{
             background: #111827;
             color: white;
         }}
 
-        .portfolio-table tr:nth-child(even) {{
+        .portfolio-table tr:nth-child(even),
+        .benchmark-table tr:nth-child(even) {{
             background: #f9fafb;
+        }}
+
+        .benchmark-grid {{
+            display: grid;
+            grid-template-columns: 1.2fr 1fr;
+            gap: 20px;
+            align-items: start;
+        }}
+
+        .benchmark-result {{
+            background: #f9fafb;
+            border-radius: 14px;
+            padding: 18px;
+            border-left: 5px solid #111827;
+            margin-bottom: 18px;
+            font-weight: bold;
+            line-height: 1.5;
+        }}
+
+        .mini-metric-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+            gap: 12px;
+            margin-bottom: 18px;
+        }}
+
+        .mini-metric {{
+            background: #f9fafb;
+            border-radius: 14px;
+            padding: 14px;
+            text-align: center;
+            border: 1px solid #e5e7eb;
+        }}
+
+        .mini-label {{
+            color: #666;
+            font-size: 13px;
+            margin-bottom: 6px;
+        }}
+
+        .mini-value {{
+            font-size: 20px;
+            font-weight: bold;
         }}
 
         .alerts-container {{
@@ -1877,6 +2093,12 @@ def create_html_report(portfolio_df, watchlist_df, ai_summary, portfolio_news, w
             color: #666;
         }}
 
+        @media (max-width: 900px) {{
+            .benchmark-grid {{
+                grid-template-columns: 1fr;
+            }}
+        }}
+
         .footer {{
             text-align: center;
             color: #777;
@@ -1897,7 +2119,7 @@ def create_html_report(portfolio_df, watchlist_df, ai_summary, portfolio_news, w
             </div>
         </div>
 
-        <div class="cards">
+        <div class="snapshot-cards">
             <div class="card">
                 <h2>Total Portfolio Value</h2>
                 <div class="value">{format_money(total_value)}</div>
@@ -1921,52 +2143,58 @@ def create_html_report(portfolio_df, watchlist_df, ai_summary, portfolio_news, w
             </div>
 
             <div class="card">
-                <h2>Best Owned Stock</h2>
-                <div class="value positive">{escape(str(best_stock["Ticker"]))}</div>
-                <div class="small-note">{format_money(best_stock["Daily Gain/Loss"])} today</div>
+                <h2>Alerts Triggered</h2>
+                <div class="value">{alert_count}</div>
+                <div class="small-note">portfolio and watchlist signals</div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>AI Summary</h2>
+            <div class="ai-summary">
+                {ai_summary_html}
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>Portfolio vs Market</h2>
+            <p class="section-intro">Compares your portfolio against SPY and QQQ so you can quickly see if you are beating or lagging the market.</p>
+
+            <div class="benchmark-result">
+                {escape(benchmark_verdict)}
             </div>
 
-            <div class="card">
-                <h2>Worst Owned Stock</h2>
-                <div class="value negative">{escape(str(worst_stock["Ticker"]))}</div>
-                <div class="small-note">{format_money(worst_stock["Daily Gain/Loss"])} today</div>
+            <div class="mini-metric-grid">
+                <div class="mini-metric">
+                    <div class="mini-label">Portfolio Today</div>
+                    <div class="mini-value {get_positive_negative_class(portfolio_daily)}">{get_sign(portfolio_daily)}{format_percent(portfolio_daily)}</div>
+                </div>
+
+                <div class="mini-metric">
+                    <div class="mini-label">SPY Today</div>
+                    <div class="mini-value {get_positive_negative_class(spy_daily)}">{get_sign(spy_daily)}{format_percent(spy_daily)}</div>
+                </div>
+
+                <div class="mini-metric">
+                    <div class="mini-label">QQQ Today</div>
+                    <div class="mini-value {get_positive_negative_class(qqq_daily)}">{get_sign(qqq_daily)}{format_percent(qqq_daily)}</div>
+                </div>
             </div>
 
-            <div class="card">
-                <h2>Largest Position</h2>
-                <div class="value">{escape(str(largest_position["Ticker"]))}</div>
-                <div class="small-note">{format_percent(largest_position["Portfolio Weight %"])} of portfolio</div>
-            </div>
+            <div class="benchmark-grid">
+                <div>
+                    {benchmark_chart}
+                </div>
 
-            <div class="card">
-                <h2>Top Watchlist Mover</h2>
-                <div class="value positive">{top_watchlist_card}</div>
-                <div class="small-note">{top_watchlist_note}</div>
-            </div>
-
-            <div class="card">
-                <h2>Weakest Watchlist Mover</h2>
-                <div class="value negative">{weak_watchlist_card}</div>
-                <div class="small-note">{weak_watchlist_note}</div>
-            </div>
-
-            <div class="card">
-                <h2>Research Signals</h2>
-                <div class="value">{strong_watch_count}</div>
-                <div class="small-note">watchlist stocks marked strong or worth watching</div>
+                <div>
+                    {benchmark_table_html}
+                </div>
             </div>
         </div>
 
         <div class="section">
             <h2>Alerts</h2>
             {alerts_html}
-        </div>
-
-        <div class="section">
-            <h2>AI Portfolio and Watchlist Summary</h2>
-            <div class="ai-summary">
-                {ai_summary_html}
-            </div>
         </div>
 
         <div class="section">
@@ -2010,10 +2238,6 @@ def create_html_report(portfolio_df, watchlist_df, ai_summary, portfolio_news, w
         </div>
 
         <div class="section">
-            {normalized_chart}
-        </div>
-
-        <div class="section">
             {moving_average_chart}
         </div>
 
@@ -2022,7 +2246,7 @@ def create_html_report(portfolio_df, watchlist_df, ai_summary, portfolio_news, w
         </div>
 
         <p class="footer">
-            Portfolio stocks are stocks you own. Watchlist stocks are stocks you are researching. Data and news are latest available from yfinance and are not professional tick-by-tick trading data. This is not financial advice.
+            Portfolio stocks are stocks you own. Watchlist stocks are stocks you are researching. SPY and QQQ are used as simple market benchmarks. Data and news are latest available from yfinance and are not professional tick-by-tick trading data. This is not financial advice.
         </p>
     </div>
 </body>
@@ -2073,6 +2297,12 @@ def main():
         print("Watchlist data loaded.")
         print(watchlist_df)
 
+    print("Building benchmark comparison...")
+    benchmark_df, portfolio_series, spy_series, qqq_series = get_benchmark_summary(portfolio_input)
+    benchmark_verdict = get_benchmark_verdict(benchmark_df)
+    benchmark_chart = create_benchmark_chart(portfolio_series, spy_series, qqq_series)
+    print("Benchmark comparison created.")
+
     portfolio_tickers = portfolio_df["Ticker"].tolist()
     watchlist_tickers = watchlist_df["Ticker"].tolist() if not watchlist_df.empty else []
 
@@ -2084,17 +2314,35 @@ def main():
     watchlist_news = get_stock_news(watchlist_tickers)
     print(f"Found {len(watchlist_news)} watchlist news items.")
 
-    ai_summary = generate_ai_summary(portfolio_df, watchlist_df, portfolio_news, watchlist_news)
+    ai_summary = generate_ai_summary(
+        portfolio_df,
+        watchlist_df,
+        portfolio_news,
+        watchlist_news,
+        benchmark_df,
+        benchmark_verdict
+    )
     print("AI summary created.")
 
-    report_path = create_html_report(portfolio_df, watchlist_df, ai_summary, portfolio_news, watchlist_news)
+    report_path = create_html_report(
+        portfolio_input,
+        portfolio_df,
+        watchlist_df,
+        ai_summary,
+        portfolio_news,
+        watchlist_news,
+        benchmark_df,
+        benchmark_verdict,
+        benchmark_chart
+    )
+
     print(f"Report saved to: {report_path}")
 
     open_report(report_path)
 
     send_mac_notification(
         "AI Financial Dashboard",
-        "Your dashboard with portfolio, watchlist, and alerts is ready."
+        "Your dashboard with benchmarks is ready."
     )
 
 
