@@ -1,33 +1,80 @@
 # AI Financial Dashboard
 
-An AI-powered financial dashboard that tracks market data, generates charts, saves daily reports, and uses a local LLM through Ollama to produce market research summaries.
+An AI-powered financial dashboard built with Python. It tracks a stock portfolio, watchlist stocks, recent stock news, alerts, charts, and AI-generated portfolio summaries using local AI through Ollama/Llama 3.2.
+
+This project is designed as a beginner-friendly finance and AI automation project.
+
+---
 
 ## Features
 
-- Tracks stocks, ETFs, and crypto using Yahoo Finance data
-- Displays current price, daily change, market cap, P/E ratio, sector, and industry
-- Saves daily market reports as CSV files
-- Saves news headline reports as CSV files
-- Generates an HTML dashboard
-- Includes a moving stock ticker display
-- Creates daily performance and 7-day percentage trend charts
-- Uses Ollama with Llama 3.2 to generate AI market research summaries
-- Avoids direct buy/sell advice and focuses on research direction
+- Tracks a personal stock portfolio
+- Tracks a separate stock watchlist
+- Pulls stock data using `yfinance`
+- Creates interactive charts using Plotly
+- Generates an AI portfolio summary using Ollama/Llama 3.2
+- Shows recent stock news for portfolio and watchlist stocks
+- Displays a moving stock ticker
+- Shows portfolio gain/loss and allocation
+- Shows watchlist movers and research signals
+- Checks automatic alerts for both portfolio and watchlist stocks
+- Opens the dashboard automatically as an HTML report
+- Supports manual running anytime
+- Supports scheduled daily running on Mac
 
-## Tools Used
+---
+
+## Main Dashboard Sections
+
+The dashboard includes:
+
+- Total portfolio value
+- Daily gain/loss
+- Total gain/loss compared to average cost
+- Best and worst owned stock
+- Largest portfolio position
+- Watchlist movers
+- Portfolio alerts
+- Watchlist alerts
+- AI summary
+- Portfolio metrics table
+- Watchlist metrics table
+- Portfolio news
+- Watchlist news
+- Portfolio allocation chart
+- Gain/loss charts
+- Moving average charts
+- Volatility chart
+
+---
+
+## Tech Stack
 
 - Python
-- yfinance
 - pandas
-- plotly
-- requests
+- yfinance
+- Plotly
 - Ollama
 - Llama 3.2
+- HTML/CSS
+- macOS LaunchAgent scheduler
+- Git/GitHub
 
-## How To Run
+---
 
-1. Create and activate a virtual environment:
+## Project Structure
 
-```bash
-python3 -m venv venv
-source venv/bin/activate
+```text
+finance-dashboard/
+├── main.py
+├── alert_checker.py
+├── portfolio.csv
+├── watchlist.csv
+├── README.md
+├── requirements.txt
+├── run_dashboard.command
+├── run_dashboard_scheduled.command
+├── com.finance.dashboard.plist
+├── .gitignore
+├── reports/
+└── venv/
