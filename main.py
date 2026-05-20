@@ -224,47 +224,123 @@ def clean_ai_text(text):
 
 
 def format_ai_summary_as_html(text):
+    """
+    Converts the AI summary into clean HTML.
+
+    Extra polish:
+    - Keeps headings separate
+    - Prevents broken half-sentence bullets
+    - Merges continuation lines into the previous bullet
+    - Keeps every bullet readable
+    """
     text = clean_ai_text(text)
 
     if not text:
         return "<p>No AI summary was generated.</p>"
 
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    html_parts = []
-    bullet_items = []
+    raw_lines = [line.strip() for line in text.splitlines() if line.strip()]
 
     headings = [
         "portfolio summary",
         "best performer",
         "worst performer",
         "total gain or loss",
-        "risk and trend notes",
-        "benchmark comparison",
         "portfolio vs market",
+        "benchmark comparison",
+        "sector allocation",
+        "dividends",
+        "dividend tracking",
+        "earnings dates",
+        "earnings tracking",
+        "risk and trend notes",
         "watchlist summary",
         "watchlist movers",
         "market and stock news",
         "beginner takeaway",
     ]
 
-    for line in lines:
-        clean_line = re.sub(r"^[-•]\s*", "", line)
+    continuation_starts = (
+        "from ",
+        "with ",
+        "and ",
+        "or ",
+        "but ",
+        "because ",
+        "while ",
+        "compared ",
+        "change of ",
+        "average ",
+        "a ",
+        "an ",
+        "the previous ",
+    )
+
+    html_parts = []
+    bullet_items = []
+
+    def flush_bullets():
+        nonlocal bullet_items
+
+        if bullet_items:
+            html_parts.append("<ul>" + "".join(f"<li>{escape(item)}</li>" for item in bullet_items) + "</ul>")
+            bullet_items = []
+
+    def is_heading(line):
+        clean = line.strip().rstrip(":")
+        return clean.lower() in headings
+
+    def normalize_heading(line):
+        clean = line.strip().rstrip(":")
+        return clean.title()
+
+    def starts_as_continuation(line):
+        lower_line = line.lower().strip()
+
+        if not bullet_items:
+            return False
+
+        if lower_line.startswith(continuation_starts):
+            return True
+
+        # If the line is short and starts lowercase, it is probably a broken sentence.
+        if line and line[0].islower() and len(line.split()) <= 10:
+            return True
+
+        # If the previous bullet does not end like a complete sentence, merge it.
+        previous = bullet_items[-1].strip()
+        if previous and previous[-1] not in ".!?":
+            return True
+
+        return False
+
+    for line in raw_lines:
+        clean_line = line.strip()
+
+        # Remove common bullet/number prefixes.
+        clean_line = re.sub(r"^[-•]\s*", "", clean_line)
         clean_line = re.sub(r"^\d+\.\s*", "", clean_line)
+        clean_line = clean_line.strip()
 
-        lower_line = clean_line.lower()
-        is_heading = clean_line.endswith(":") or lower_line in headings
+        if not clean_line:
+            continue
 
-        if is_heading:
-            if bullet_items:
-                html_parts.append("<ul>" + "".join(bullet_items) + "</ul>")
-                bullet_items = []
+        if is_heading(clean_line):
+            flush_bullets()
+            html_parts.append(f"<h3>{escape(normalize_heading(clean_line))}</h3>")
+            continue
 
-            html_parts.append(f"<h3>{escape(clean_line.rstrip(':'))}</h3>")
+        # Handle accidental heading-like bullets.
+        if clean_line.lower().rstrip(":") in headings:
+            flush_bullets()
+            html_parts.append(f"<h3>{escape(normalize_heading(clean_line))}</h3>")
+            continue
+
+        if starts_as_continuation(clean_line):
+            bullet_items[-1] = bullet_items[-1].rstrip() + " " + clean_line
         else:
-            bullet_items.append(f"<li>{escape(clean_line)}</li>")
+            bullet_items.append(clean_line)
 
-    if bullet_items:
-        html_parts.append("<ul>" + "".join(bullet_items) + "</ul>")
+    flush_bullets()
 
     return "\n".join(html_parts)
 
@@ -1676,7 +1752,10 @@ Do not use markdown.
 Do not use asterisks.
 Do not use hashtags.
 Use plain sentences only.
-Keep every point short.
+Every bullet must be a complete sentence.
+Do not split one sentence across multiple bullets.
+Do not create short continuation bullets like "from previous close" or "average cost."
+Keep the entire summary short, professional, and easy to read.
 Do not give official financial advice.
 
 Portfolio data:
@@ -2169,18 +2248,27 @@ def create_html_report(portfolio_input, portfolio_df, watchlist_df, ai_summary, 
             line-height: 1.5;
         }}
 
-        .ai-summary {{
-            line-height: 1.6;
+                .ai-summary {{
+            line-height: 1.7;
             background: #f9fafb;
             padding: 18px;
             border-radius: 12px;
             border-left: 5px solid #111827;
+            max-width: 100%;
+            box-sizing: border-box;
+            overflow-wrap: break-word;
+            word-wrap: break-word;
+            word-break: normal;
+            white-space: normal;
         }}
 
         .ai-summary h3 {{
             margin-bottom: 8px;
             margin-top: 18px;
             color: #111827;
+            overflow-wrap: break-word;
+            word-wrap: break-word;
+            white-space: normal;
         }}
 
         .ai-summary h3:first-child {{
@@ -2191,11 +2279,18 @@ def create_html_report(portfolio_input, portfolio_df, watchlist_df, ai_summary, 
             margin-top: 5px;
             margin-bottom: 12px;
             padding-left: 24px;
+            overflow-wrap: break-word;
+            word-wrap: break-word;
+            white-space: normal;
         }}
 
         .ai-summary li {{
             margin-bottom: 8px;
+            overflow-wrap: break-word;
+            word-wrap: break-word;
+            white-space: normal;
         }}
+
 
         .portfolio-table,
         .benchmark-table {{
