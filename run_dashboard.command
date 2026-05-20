@@ -19,7 +19,11 @@ echo "Running dashboard manually..."
 python3 main.py
 
 echo ""
-echo "Finished running dashboard."
+echo "Checking alerts for your portfolio and watchlist..."
+python3 alert_checker.py
+
+echo ""
+echo "Finished running dashboard and alerts."
 echo "If there was an error, read the message above."
 
 read -p "Press Enter to close this window..."

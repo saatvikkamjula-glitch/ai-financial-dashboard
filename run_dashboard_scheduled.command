@@ -15,8 +15,12 @@ else
 fi
 
 echo ""
-echo "Running dashboard automatically with existing portfolio.csv..."
-echo "y" | python3 main.py
+echo "Running dashboard automatically with existing portfolio.csv and watchlist.csv..."
+printf "y\ny\n" | python3 main.py
 
 echo ""
-echo "Finished scheduled dashboard run."
+echo "Checking alerts automatically for portfolio and watchlist..."
+python3 alert_checker.py
+
+echo ""
+echo "Finished scheduled dashboard and alert run."
