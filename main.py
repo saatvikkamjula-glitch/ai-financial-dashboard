@@ -95,7 +95,11 @@ def load_portfolio():
         use_existing = ask_yes_no("Do you want to use your existing portfolio.csv?")
 
         if use_existing:
-            df = pd.read_csv(PORTFOLIO_FILE)
+            try:
+                df = pd.read_csv(PORTFOLIO_FILE)
+            except pd.errors.EmptyDataError:
+                print("portfolio.csv is empty.")
+                df = create_portfolio_from_terminal()
         else:
             df = create_portfolio_from_terminal()
     else:
@@ -157,7 +161,11 @@ def load_watchlist():
         use_existing = ask_yes_no("Do you want to use your existing watchlist.csv?")
 
         if use_existing:
-            df = pd.read_csv(WATCHLIST_FILE)
+            try:
+                df = pd.read_csv(WATCHLIST_FILE)
+            except pd.errors.EmptyDataError:
+                print("watchlist.csv is empty.")
+                df = create_watchlist_from_terminal()
         else:
             df = create_watchlist_from_terminal()
     else:
@@ -184,10 +192,13 @@ def load_watchlist():
 def send_mac_notification(title, message):
     if platform.system() == "Darwin":
         try:
+            safe_title = str(title).replace('"', "'")
+            safe_message = str(message).replace('"', "'")
+
             subprocess.run([
                 "osascript",
                 "-e",
-                f'display notification "{message}" with title "{title}"'
+                f'display notification "{safe_message}" with title "{safe_title}"'
             ])
         except Exception:
             print(f"{title}: {message}")
@@ -436,6 +447,143 @@ def get_research_signal(row):
 
 
 # ============================================================
+# DASHBOARD ALERT FUNCTIONS
+# ============================================================
+
+def build_dashboard_alerts(portfolio_df, watchlist_df):
+    alerts = []
+
+    def check_row(row, category):
+        ticker = row["Ticker"]
+        daily_change = row.get("Daily Change %")
+        rsi = row.get("RSI")
+        distance_from_high = row.get("Distance From 52W High %")
+        trend = row.get("Trend Signal")
+
+        if pd.notna(daily_change) and abs(daily_change) >= 3:
+            direction = "up" if daily_change >= 0 else "down"
+
+            alerts.append({
+                "Category": category,
+                "Ticker": ticker,
+                "Type": "Large Daily Move",
+                "Level": "high",
+                "Message": f"{ticker} is {direction} {abs(daily_change):.2f}% today."
+            })
+
+        if pd.notna(rsi) and rsi >= 70:
+            alerts.append({
+                "Category": category,
+                "Ticker": ticker,
+                "Type": "RSI Overbought",
+                "Level": "medium",
+                "Message": f"{ticker} has an RSI of {rsi:.2f}, which may be overbought."
+            })
+
+        if pd.notna(rsi) and rsi <= 30:
+            alerts.append({
+                "Category": category,
+                "Ticker": ticker,
+                "Type": "RSI Oversold",
+                "Level": "medium",
+                "Message": f"{ticker} has an RSI of {rsi:.2f}, which may be oversold."
+            })
+
+        if pd.notna(distance_from_high) and distance_from_high >= -5:
+            alerts.append({
+                "Category": category,
+                "Ticker": ticker,
+                "Type": "Near 52-Week High",
+                "Level": "low",
+                "Message": f"{ticker} is close to its 52-week high."
+            })
+
+        if pd.notna(distance_from_high) and distance_from_high <= -25:
+            alerts.append({
+                "Category": category,
+                "Ticker": ticker,
+                "Type": "Far From 52-Week High",
+                "Level": "low",
+                "Message": f"{ticker} is {distance_from_high:.2f}% below its 52-week high."
+            })
+
+        if trend == "Bearish trend":
+            alerts.append({
+                "Category": category,
+                "Ticker": ticker,
+                "Type": "Bearish Trend",
+                "Level": "medium",
+                "Message": f"{ticker} is showing a bearish moving-average trend."
+            })
+
+    for _, row in portfolio_df.iterrows():
+        check_row(row, "Portfolio")
+
+    if not watchlist_df.empty:
+        for _, row in watchlist_df.iterrows():
+            check_row(row, "Watchlist")
+
+    return alerts
+
+
+def create_alert_cards_html(alerts):
+    portfolio_alerts = [alert for alert in alerts if alert["Category"] == "Portfolio"]
+    watchlist_alerts = [alert for alert in alerts if alert["Category"] == "Watchlist"]
+
+    def build_group(title, group_alerts):
+        if not group_alerts:
+            return f"""
+            <div class="alert-group">
+                <h3>{title}</h3>
+                <div class="alert-empty">No alerts triggered.</div>
+            </div>
+            """
+
+        cards = ""
+
+        for alert in group_alerts:
+            cards += f"""
+            <div class="alert-card alert-{alert["Level"]}">
+                <div class="alert-top">
+                    <span class="alert-ticker">{escape(str(alert["Ticker"]))}</span>
+                    <span class="alert-type">{escape(str(alert["Type"]))}</span>
+                </div>
+                <div class="alert-message">{escape(str(alert["Message"]))}</div>
+            </div>
+            """
+
+        return f"""
+        <div class="alert-group">
+            <h3>{title}</h3>
+            <div class="alert-grid">
+                {cards}
+            </div>
+        </div>
+        """
+
+    return f"""
+    <div class="alerts-container">
+        {build_group("Portfolio Alerts", portfolio_alerts)}
+        {build_group("Watchlist Alerts", watchlist_alerts)}
+    </div>
+    """
+
+
+def wrap_section(content, title=None):
+    if content is None or str(content).strip() == "":
+        return ""
+
+    heading = f"<h2>{title}</h2>" if title else ""
+
+    return f"""
+    <div class="section">
+        {heading}
+        {content}
+    </div>
+    """
+
+
+# ============================================================
 # STOCK DATA
 # ============================================================
 
@@ -460,6 +608,9 @@ def get_stock_data(ticker):
 
         current_price = last_price if last_price is not None else latest_close
         previous_price = previous_close_fast if previous_close_fast is not None else previous_close
+
+        if current_price is None or previous_price is None:
+            return None
 
         daily_change = current_price - previous_price
         daily_change_percent = (daily_change / previous_price) * 100 if previous_price else 0
@@ -776,9 +927,24 @@ def news_items_to_text(news_items, max_items=10):
 # ============================================================
 
 def create_portfolio_value_chart(df):
-    fig = px.bar(df, x="Ticker", y="Current Value", title="Portfolio Value by Stock", text="Current Value", color="Ticker")
+    fig = px.bar(
+        df,
+        x="Ticker",
+        y="Current Value",
+        title="Portfolio Value by Stock",
+        text="Current Value",
+        color="Ticker"
+    )
+
     fig.update_traces(texttemplate="$%{text:.2f}", textposition="outside")
-    fig.update_layout(xaxis_title="Stock", yaxis_title="Current Value", template="plotly_white", showlegend=False)
+
+    fig.update_layout(
+        xaxis_title="Stock",
+        yaxis_title="Current Value",
+        template="plotly_white",
+        showlegend=False
+    )
+
     return fig.to_html(full_html=False, include_plotlyjs="cdn")
 
 
@@ -795,8 +961,14 @@ def create_daily_gain_loss_chart(df):
         marker_color=colors
     ))
 
-    fig.update_layout(title="Daily Gain/Loss by Owned Stock", xaxis_title="Stock", yaxis_title="Gain/Loss", template="plotly_white")
-    return fig.to_html(full_html=False, include_plotlyjs=False)
+    fig.update_layout(
+        title="Daily Gain/Loss by Owned Stock",
+        xaxis_title="Stock",
+        yaxis_title="Gain/Loss",
+        template="plotly_white"
+    )
+
+    return fig.to_html(full_html=False, include_plotlyjs="cdn")
 
 
 def create_total_gain_loss_chart(df):
@@ -812,15 +984,28 @@ def create_total_gain_loss_chart(df):
         marker_color=colors
     ))
 
-    fig.update_layout(title="Total Gain/Loss Compared to Average Cost", xaxis_title="Stock", yaxis_title="Total Gain/Loss", template="plotly_white")
-    return fig.to_html(full_html=False, include_plotlyjs=False)
+    fig.update_layout(
+        title="Total Gain/Loss Compared to Average Cost",
+        xaxis_title="Stock",
+        yaxis_title="Total Gain/Loss",
+        template="plotly_white"
+    )
+
+    return fig.to_html(full_html=False, include_plotlyjs="cdn")
 
 
 def create_allocation_chart(df):
-    fig = px.pie(df, names="Ticker", values="Current Value", title="Portfolio Allocation")
+    fig = px.pie(
+        df,
+        names="Ticker",
+        values="Current Value",
+        title="Portfolio Allocation"
+    )
+
     fig.update_traces(textposition="inside", textinfo="percent+label")
     fig.update_layout(template="plotly_white")
-    return fig.to_html(full_html=False, include_plotlyjs=False)
+
+    return fig.to_html(full_html=False, include_plotlyjs="cdn")
 
 
 def create_watchlist_movers_chart(watchlist_df):
@@ -828,6 +1013,10 @@ def create_watchlist_movers_chart(watchlist_df):
         return ""
 
     sorted_df = watchlist_df.sort_values("Daily Change %", ascending=False).copy()
+
+    if sorted_df.empty:
+        return ""
+
     colors = ["green" if value >= 0 else "red" for value in sorted_df["Daily Change %"]]
 
     fig = go.Figure()
@@ -840,8 +1029,14 @@ def create_watchlist_movers_chart(watchlist_df):
         marker_color=colors
     ))
 
-    fig.update_layout(title="Watchlist Daily Movers", xaxis_title="Ticker", yaxis_title="Daily Change %", template="plotly_white")
-    return fig.to_html(full_html=False, include_plotlyjs=False)
+    fig.update_layout(
+        title="Watchlist Daily Movers",
+        xaxis_title="Ticker",
+        yaxis_title="Daily Change %",
+        template="plotly_white"
+    )
+
+    return fig.to_html(full_html=False, include_plotlyjs="cdn")
 
 
 def create_watchlist_rsi_chart(watchlist_df):
@@ -875,9 +1070,15 @@ def create_watchlist_rsi_chart(watchlist_df):
 
     fig.add_hline(y=70, line_dash="dash", annotation_text="Overbought")
     fig.add_hline(y=30, line_dash="dash", annotation_text="Oversold")
-    fig.update_layout(title="Watchlist RSI", xaxis_title="Ticker", yaxis_title="RSI", template="plotly_white")
 
-    return fig.to_html(full_html=False, include_plotlyjs=False)
+    fig.update_layout(
+        title="Watchlist RSI",
+        xaxis_title="Ticker",
+        yaxis_title="RSI",
+        template="plotly_white"
+    )
+
+    return fig.to_html(full_html=False, include_plotlyjs="cdn")
 
 
 def create_normalized_performance_chart(tickers):
@@ -890,6 +1091,10 @@ def create_normalized_performance_chart(tickers):
             continue
 
         history = data["history"]
+
+        if history.empty:
+            continue
+
         normalized = history["Close"] / history["Close"].iloc[0] * 100
 
         fig.add_trace(go.Scatter(
@@ -899,8 +1104,14 @@ def create_normalized_performance_chart(tickers):
             name=ticker
         ))
 
-    fig.update_layout(title="6-Month Normalized Performance", xaxis_title="Date", yaxis_title="Starting at 100", template="plotly_white")
-    return fig.to_html(full_html=False, include_plotlyjs=False)
+    fig.update_layout(
+        title="6-Month Normalized Performance",
+        xaxis_title="Date",
+        yaxis_title="Starting at 100",
+        template="plotly_white"
+    )
+
+    return fig.to_html(full_html=False, include_plotlyjs="cdn")
 
 
 def create_moving_average_chart(tickers):
@@ -913,15 +1124,44 @@ def create_moving_average_chart(tickers):
             continue
 
         history = data["history"].copy()
+
+        if history.empty:
+            continue
+
         history["SMA 20"] = history["Close"].rolling(window=20).mean()
         history["SMA 50"] = history["Close"].rolling(window=50).mean()
 
-        fig.add_trace(go.Scatter(x=history.index, y=history["Close"], mode="lines", name=f"{ticker} Price"))
-        fig.add_trace(go.Scatter(x=history.index, y=history["SMA 20"], mode="lines", name=f"{ticker} 20D SMA", line=dict(dash="dash")))
-        fig.add_trace(go.Scatter(x=history.index, y=history["SMA 50"], mode="lines", name=f"{ticker} 50D SMA", line=dict(dash="dot")))
+        fig.add_trace(go.Scatter(
+            x=history.index,
+            y=history["Close"],
+            mode="lines",
+            name=f"{ticker} Price"
+        ))
 
-    fig.update_layout(title="Price With Moving Averages", xaxis_title="Date", yaxis_title="Price", template="plotly_white")
-    return fig.to_html(full_html=False, include_plotlyjs=False)
+        fig.add_trace(go.Scatter(
+            x=history.index,
+            y=history["SMA 20"],
+            mode="lines",
+            name=f"{ticker} 20D SMA",
+            line=dict(dash="dash")
+        ))
+
+        fig.add_trace(go.Scatter(
+            x=history.index,
+            y=history["SMA 50"],
+            mode="lines",
+            name=f"{ticker} 50D SMA",
+            line=dict(dash="dot")
+        ))
+
+    fig.update_layout(
+        title="Price With Moving Averages",
+        xaxis_title="Date",
+        yaxis_title="Price",
+        template="plotly_white"
+    )
+
+    return fig.to_html(full_html=False, include_plotlyjs="cdn")
 
 
 def create_volatility_chart(df):
@@ -936,9 +1176,15 @@ def create_volatility_chart(df):
     )
 
     fig.update_traces(texttemplate="%{text:.2f}%", textposition="outside")
-    fig.update_layout(xaxis_title="Stock", yaxis_title="Volatility", template="plotly_white", showlegend=False)
 
-    return fig.to_html(full_html=False, include_plotlyjs=False)
+    fig.update_layout(
+        xaxis_title="Stock",
+        yaxis_title="Volatility",
+        template="plotly_white",
+        showlegend=False
+    )
+
+    return fig.to_html(full_html=False, include_plotlyjs="cdn")
 
 
 # ============================================================
@@ -1281,6 +1527,9 @@ def create_html_report(portfolio_df, watchlist_df, ai_summary, portfolio_news, w
     watchlist_table_html = create_watchlist_table_html(watchlist_df)
     ai_summary_html = format_ai_summary_as_html(ai_summary)
 
+    dashboard_alerts = build_dashboard_alerts(portfolio_df, watchlist_df)
+    alerts_html = create_alert_cards_html(dashboard_alerts)
+
     portfolio_news_html = create_news_html(portfolio_news)
     watchlist_news_html = create_news_html(watchlist_news)
 
@@ -1288,8 +1537,13 @@ def create_html_report(portfolio_df, watchlist_df, ai_summary, portfolio_news, w
     daily_gain_loss_chart = create_daily_gain_loss_chart(portfolio_df)
     total_gain_loss_chart = create_total_gain_loss_chart(portfolio_df)
     allocation_chart = create_allocation_chart(portfolio_df)
+
     watchlist_movers_chart = create_watchlist_movers_chart(watchlist_df)
     watchlist_rsi_chart = create_watchlist_rsi_chart(watchlist_df)
+
+    watchlist_movers_section = wrap_section(watchlist_movers_chart)
+    watchlist_rsi_section = wrap_section(watchlist_rsi_chart)
+
     normalized_chart = create_normalized_performance_chart(all_tickers)
     moving_average_chart = create_moving_average_chart(all_tickers)
     volatility_chart = create_volatility_chart(portfolio_df)
@@ -1495,6 +1749,81 @@ def create_html_report(portfolio_df, watchlist_df, ai_summary, portfolio_news, w
             background: #f9fafb;
         }}
 
+        .alerts-container {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 20px;
+        }}
+
+        .alert-group h3 {{
+            margin-top: 0;
+            color: #111827;
+        }}
+
+        .alert-grid {{
+            display: grid;
+            gap: 12px;
+        }}
+
+        .alert-card {{
+            border-radius: 14px;
+            padding: 16px;
+            border-left: 6px solid #111827;
+            background: #f9fafb;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+        }}
+
+        .alert-high {{
+            border-left-color: red;
+            background: #fff5f5;
+        }}
+
+        .alert-medium {{
+            border-left-color: orange;
+            background: #fffaf0;
+        }}
+
+        .alert-low {{
+            border-left-color: #2563eb;
+            background: #eff6ff;
+        }}
+
+        .alert-top {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 8px;
+        }}
+
+        .alert-ticker {{
+            font-size: 18px;
+            font-weight: bold;
+            color: #111827;
+        }}
+
+        .alert-type {{
+            font-size: 12px;
+            background: #111827;
+            color: white;
+            padding: 5px 8px;
+            border-radius: 999px;
+            white-space: nowrap;
+        }}
+
+        .alert-message {{
+            color: #333;
+            line-height: 1.4;
+        }}
+
+        .alert-empty {{
+            background: #f9fafb;
+            color: #666;
+            padding: 16px;
+            border-radius: 14px;
+            border: 1px solid #e5e7eb;
+        }}
+
         .news-grid {{
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
@@ -1629,6 +1958,11 @@ def create_html_report(portfolio_df, watchlist_df, ai_summary, portfolio_news, w
         </div>
 
         <div class="section">
+            <h2>Alerts</h2>
+            {alerts_html}
+        </div>
+
+        <div class="section">
             <h2>AI Portfolio and Watchlist Summary</h2>
             <div class="ai-summary">
                 {ai_summary_html}
@@ -1640,13 +1974,9 @@ def create_html_report(portfolio_df, watchlist_df, ai_summary, portfolio_news, w
             {watchlist_table_html}
         </div>
 
-        <div class="section">
-            {watchlist_movers_chart}
-        </div>
+        {watchlist_movers_section}
 
-        <div class="section">
-            {watchlist_rsi_chart}
-        </div>
+        {watchlist_rsi_section}
 
         <div class="section">
             <h2>Watchlist News</h2>
@@ -1764,7 +2094,7 @@ def main():
 
     send_mac_notification(
         "AI Financial Dashboard",
-        "Your dashboard with portfolio and watchlist is ready."
+        "Your dashboard with portfolio, watchlist, and alerts is ready."
     )
 
 
