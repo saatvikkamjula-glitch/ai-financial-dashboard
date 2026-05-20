@@ -589,6 +589,66 @@ def wrap_section(content, title=None):
 # STOCK DATA
 # ============================================================
 
+def format_possible_date(value):
+    try:
+        if value is None:
+            return "N/A"
+
+        if isinstance(value, (list, tuple)) and len(value) > 0:
+            value = value[0]
+
+        if isinstance(value, pd.Series) and not value.empty:
+            value = value.iloc[0]
+
+        if isinstance(value, pd.DataFrame) and not value.empty:
+            value = value.iloc[0, 0]
+
+        date_value = pd.to_datetime(value, errors="coerce")
+
+        if pd.isna(date_value):
+            return "N/A"
+
+        return date_value.strftime("%b %d, %Y")
+    except Exception:
+        return "N/A"
+
+
+def get_next_earnings_date(stock, info):
+    try:
+        if info.get("nextEarningsDate"):
+            return format_possible_date(info.get("nextEarningsDate"))
+
+        calendar = stock.calendar
+
+        if isinstance(calendar, dict):
+            for key in ["Earnings Date", "earningsDate"]:
+                if key in calendar:
+                    return format_possible_date(calendar[key])
+
+        if isinstance(calendar, pd.DataFrame) and not calendar.empty:
+            for possible_index in ["Earnings Date", "Earnings Average"]:
+                if possible_index in calendar.index:
+                    return format_possible_date(calendar.loc[possible_index].values[0])
+
+            return format_possible_date(calendar.iloc[0, 0])
+    except Exception:
+        pass
+
+    return "N/A"
+
+
+def clean_dividend_yield(value):
+    value = safe_float(value)
+
+    if value is None:
+        return None
+
+    if value <= 1:
+        return value * 100
+
+    return value
+
+
 def get_stock_data(ticker):
     try:
         stock = yf.Ticker(ticker)
@@ -598,6 +658,11 @@ def get_stock_data(ticker):
             return None
 
         history = history.dropna()
+
+        try:
+            info = stock.info or {}
+        except Exception:
+            info = {}
 
         latest_close = safe_float(history["Close"].iloc[-1])
         previous_close = safe_float(history["Close"].iloc[-2])
@@ -634,9 +699,19 @@ def get_stock_data(ticker):
         if year_high is not None and year_high != 0:
             distance_from_52w_high = ((current_price - year_high) / year_high) * 100
 
+        dividend_yield = clean_dividend_yield(
+            info.get("dividendYield")
+            or info.get("trailingAnnualDividendYield")
+            or info.get("fiveYearAvgDividendYield")
+        )
+
         return {
             "ticker": ticker,
-            "company_name": get_company_name(ticker),
+            "company_name": info.get("shortName") or info.get("longName") or ticker,
+            "sector": info.get("sector") or "Unknown",
+            "industry": info.get("industry") or "Unknown",
+            "dividend_yield": dividend_yield,
+            "earnings_date": get_next_earnings_date(stock, info),
             "history": history,
             "current_price": current_price,
             "previous_price": previous_price,
@@ -660,7 +735,6 @@ def get_stock_data(ticker):
     except Exception as error:
         print(f"Error getting data for {ticker}: {error}")
         return None
-
 
 def build_portfolio_dataframe(portfolio_input):
     rows = []
@@ -687,6 +761,8 @@ def build_portfolio_dataframe(portfolio_input):
         rows.append({
             "Ticker": ticker,
             "Company": data["company_name"],
+            "Sector": data["sector"],
+            "Industry": data["industry"],
             "Shares": shares,
             "Average Cost": average_cost,
             "Current Price": round(data["current_price"], 2),
@@ -712,6 +788,9 @@ def build_portfolio_dataframe(portfolio_input):
             "52W Low": round(data["year_low"], 2) if data["year_low"] is not None else None,
             "Distance From 52W High %": round(data["distance_from_52w_high"], 2) if data["distance_from_52w_high"] is not None else None,
             "Market Cap": data["market_cap"],
+            "Dividend Yield %": round(data["dividend_yield"], 2) if data["dividend_yield"] is not None else None,
+            "Estimated Annual Dividend": round(current_value * (data["dividend_yield"] / 100), 2) if data["dividend_yield"] is not None else 0,
+            "Next Earnings Date": data["earnings_date"],
         })
 
     df = pd.DataFrame(rows)
@@ -739,6 +818,8 @@ def build_watchlist_dataframe(watchlist_input):
         rows.append({
             "Ticker": ticker,
             "Company": data["company_name"],
+            "Sector": data["sector"],
+            "Industry": data["industry"],
             "Current Price": round(data["current_price"], 2),
             "Previous Price": round(data["previous_price"], 2),
             "Daily Change": round(data["daily_change"], 2),
@@ -756,6 +837,8 @@ def build_watchlist_dataframe(watchlist_input):
             "52W Low": round(data["year_low"], 2) if data["year_low"] is not None else None,
             "Distance From 52W High %": round(data["distance_from_52w_high"], 2) if data["distance_from_52w_high"] is not None else None,
             "Market Cap": data["market_cap"],
+            "Dividend Yield %": round(data["dividend_yield"], 2) if data["dividend_yield"] is not None else None,
+            "Next Earnings Date": data["earnings_date"],
         })
 
     df = pd.DataFrame(rows)
@@ -767,6 +850,212 @@ def build_watchlist_dataframe(watchlist_input):
 
     return df
 
+
+
+# ============================================================
+# SECTOR, DIVIDEND, AND EARNINGS FUNCTIONS
+# ============================================================
+
+def build_sector_allocation(portfolio_df):
+    if portfolio_df.empty or "Sector" not in portfolio_df.columns:
+        return pd.DataFrame()
+
+    sector_df = (
+        portfolio_df
+        .groupby("Sector", dropna=False)["Current Value"]
+        .sum()
+        .reset_index()
+        .sort_values("Current Value", ascending=False)
+    )
+
+    total_value = sector_df["Current Value"].sum()
+
+    if total_value > 0:
+        sector_df["Weight %"] = (sector_df["Current Value"] / total_value * 100).round(2)
+    else:
+        sector_df["Weight %"] = 0
+
+    return sector_df
+
+
+def create_sector_cards_html(sector_df):
+    if sector_df.empty:
+        return "<p>No sector data available.</p>"
+
+    cards = ""
+
+    for _, row in sector_df.iterrows():
+        cards += f"""
+        <div class="sector-card">
+            <div class="sector-name">{escape(str(row["Sector"]))}</div>
+            <div class="sector-weight">{format_percent(row["Weight %"])}</div>
+            <div class="sector-value">{format_money(row["Current Value"])}</div>
+        </div>
+        """
+
+    return f"""
+    <div class="sector-card-grid">
+        {cards}
+    </div>
+    """
+
+
+def create_sector_pie_chart(sector_df):
+    if sector_df.empty:
+        return ""
+
+    fig = px.pie(
+        sector_df,
+        names="Sector",
+        values="Current Value",
+        title="Sector Allocation"
+    )
+
+    fig.update_traces(textposition="inside", textinfo="percent+label")
+    fig.update_layout(template="plotly_white")
+
+    return fig.to_html(full_html=False, include_plotlyjs="cdn")
+
+
+def create_sector_table_html(sector_df):
+    if sector_df.empty:
+        return "<p>No sector data available.</p>"
+
+    rows = ""
+
+    for _, row in sector_df.iterrows():
+        rows += f"""
+        <tr>
+            <td><strong>{escape(str(row["Sector"]))}</strong></td>
+            <td>{format_money(row["Current Value"])}</td>
+            <td>{format_percent(row["Weight %"])}</td>
+        </tr>
+        """
+
+    return f"""
+    <table class="benchmark-table">
+        <thead>
+            <tr>
+                <th>Sector</th>
+                <th>Value</th>
+                <th>Portfolio Weight</th>
+            </tr>
+        </thead>
+        <tbody>
+            {rows}
+        </tbody>
+    </table>
+    """
+
+
+def get_sector_concentration_note(sector_df):
+    if sector_df.empty:
+        return "No sector data available."
+
+    top_sector = sector_df.iloc[0]
+
+    if top_sector["Weight %"] >= 50:
+        return f'Your portfolio is heavily concentrated in {top_sector["Sector"]} at {top_sector["Weight %"]:.2f}%.'
+
+    if top_sector["Weight %"] >= 35:
+        return f'Your largest sector is {top_sector["Sector"]} at {top_sector["Weight %"]:.2f}%, so it is worth watching concentration risk.'
+
+    return f'Your largest sector is {top_sector["Sector"]} at {top_sector["Weight %"]:.2f}%.'
+
+
+def create_dividend_table_html(portfolio_df):
+    if portfolio_df.empty or "Dividend Yield %" not in portfolio_df.columns:
+        return "<p>No dividend data available.</p>"
+
+    dividend_df = portfolio_df.copy()
+    dividend_df["Estimated Annual Dividend"] = pd.to_numeric(dividend_df["Estimated Annual Dividend"], errors="coerce").fillna(0)
+    dividend_df = dividend_df.sort_values("Estimated Annual Dividend", ascending=False)
+
+    rows = ""
+
+    for _, row in dividend_df.iterrows():
+        rows += f"""
+        <tr>
+            <td><strong>{escape(str(row["Ticker"]))}</strong></td>
+            <td>{escape(str(row["Company"]))}</td>
+            <td>{format_percent(row["Dividend Yield %"])}</td>
+            <td>{format_money(row["Estimated Annual Dividend"])}</td>
+        </tr>
+        """
+
+    total_estimated_dividend = dividend_df["Estimated Annual Dividend"].sum()
+
+    return f"""
+    <div class="dividend-summary">
+        Estimated annual dividend income: <strong>{format_money(total_estimated_dividend)}</strong>
+    </div>
+
+    <table class="benchmark-table">
+        <thead>
+            <tr>
+                <th>Ticker</th>
+                <th>Company</th>
+                <th>Dividend Yield</th>
+                <th>Estimated Annual Dividend</th>
+            </tr>
+        </thead>
+        <tbody>
+            {rows}
+        </tbody>
+    </table>
+    """
+
+
+def create_earnings_table_html(portfolio_df, watchlist_df):
+    combined_rows = []
+
+    for _, row in portfolio_df.iterrows():
+        combined_rows.append({
+            "Category": "Portfolio",
+            "Ticker": row["Ticker"],
+            "Company": row["Company"],
+            "Next Earnings Date": row.get("Next Earnings Date", "N/A"),
+        })
+
+    if not watchlist_df.empty:
+        for _, row in watchlist_df.iterrows():
+            combined_rows.append({
+                "Category": "Watchlist",
+                "Ticker": row["Ticker"],
+                "Company": row["Company"],
+                "Next Earnings Date": row.get("Next Earnings Date", "N/A"),
+            })
+
+    if not combined_rows:
+        return "<p>No earnings data available.</p>"
+
+    rows = ""
+
+    for item in combined_rows:
+        rows += f"""
+        <tr>
+            <td>{escape(str(item["Category"]))}</td>
+            <td><strong>{escape(str(item["Ticker"]))}</strong></td>
+            <td>{escape(str(item["Company"]))}</td>
+            <td>{escape(str(item["Next Earnings Date"]))}</td>
+        </tr>
+        """
+
+    return f"""
+    <table class="benchmark-table">
+        <thead>
+            <tr>
+                <th>Category</th>
+                <th>Ticker</th>
+                <th>Company</th>
+                <th>Next Earnings Date</th>
+            </tr>
+        </thead>
+        <tbody>
+            {rows}
+        </tbody>
+    </table>
+    """
 
 # ============================================================
 # NEWS FUNCTIONS
@@ -1356,7 +1645,7 @@ def create_volatility_chart(df):
 # AI SUMMARY
 # ============================================================
 
-def generate_ai_summary(portfolio_df, watchlist_df, portfolio_news, watchlist_news, benchmark_df, benchmark_verdict):
+def generate_ai_summary(portfolio_df, watchlist_df, portfolio_news, watchlist_news, benchmark_df, benchmark_verdict, sector_note):
     total_value = portfolio_df["Current Value"].sum()
     previous_value = portfolio_df["Previous Value"].sum()
     total_daily_gain_loss = portfolio_df["Daily Gain/Loss"].sum()
@@ -1402,6 +1691,9 @@ Benchmark data:
 Benchmark result:
 {benchmark_verdict}
 
+Sector concentration note:
+{sector_note}
+
 Recent portfolio news:
 {portfolio_news_text}
 
@@ -1427,6 +1719,9 @@ Total Gain or Loss:
 Portfolio vs Market:
 - Explain whether the portfolio beat or lagged SPY and QQQ today.
 - Keep it simple.
+
+Sector Allocation:
+- Mention the sector concentration note.
 
 Risk and Trend Notes:
 - Mention RSI, moving averages, volatility, and allocation.
@@ -1476,6 +1771,9 @@ Your total gain or loss compared to average cost is {get_sign(total_unrealized_g
 
 Portfolio vs Market:
 {benchmark_verdict}
+
+Sector Allocation:
+{sector_note}
 
 Risk and Trend Notes:
 Your largest position is {largest_position["Ticker"]}, which is {format_percent(largest_position["Portfolio Weight %"])} of your portfolio.
@@ -1659,7 +1957,7 @@ def create_watchlist_table_html(df):
     """
 
 
-def create_html_report(portfolio_input, portfolio_df, watchlist_df, ai_summary, portfolio_news, watchlist_news, benchmark_df, benchmark_verdict, benchmark_chart):
+def create_html_report(portfolio_input, portfolio_df, watchlist_df, ai_summary, portfolio_news, watchlist_news, benchmark_df, benchmark_verdict, benchmark_chart, sector_df, sector_note):
     REPORTS_FOLDER.mkdir(exist_ok=True)
 
     total_value = portfolio_df["Current Value"].sum()
@@ -1687,6 +1985,11 @@ def create_html_report(portfolio_input, portfolio_df, watchlist_df, ai_summary, 
     ai_summary_html = format_ai_summary_as_html(ai_summary)
     alerts_html = create_alert_cards_html(dashboard_alerts)
     benchmark_table_html = create_benchmark_table_html(benchmark_df)
+    sector_cards_html = create_sector_cards_html(sector_df)
+    sector_chart = create_sector_pie_chart(sector_df)
+    sector_table_html = create_sector_table_html(sector_df)
+    dividend_table_html = create_dividend_table_html(portfolio_df)
+    earnings_table_html = create_earnings_table_html(portfolio_df, watchlist_df)
 
     portfolio_news_html = create_news_html(portfolio_news)
     watchlist_news_html = create_news_html(watchlist_news)
@@ -2093,6 +2396,68 @@ def create_html_report(portfolio_input, portfolio_df, watchlist_df, ai_summary, 
             color: #666;
         }}
 
+        .sector-card-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+            gap: 14px;
+            margin-bottom: 20px;
+        }}
+
+        .sector-card {{
+            background: #f9fafb;
+            border: 1px solid #e5e7eb;
+            border-radius: 14px;
+            padding: 16px;
+            text-align: center;
+        }}
+
+        .sector-name {{
+            color: #555;
+            font-size: 14px;
+            margin-bottom: 8px;
+        }}
+
+        .sector-weight {{
+            font-size: 24px;
+            font-weight: bold;
+            color: #111827;
+        }}
+
+        .sector-value {{
+            color: #777;
+            margin-top: 6px;
+            font-size: 13px;
+        }}
+
+        .dividend-summary {{
+            background: #f9fafb;
+            border-left: 5px solid #111827;
+            border-radius: 12px;
+            padding: 16px;
+            margin-bottom: 18px;
+            line-height: 1.5;
+        }}
+
+        .action-buttons {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+        }}
+
+        .action-button {{
+            border: none;
+            background: #111827;
+            color: white;
+            padding: 12px 16px;
+            border-radius: 12px;
+            cursor: pointer;
+            font-weight: bold;
+        }}
+
+        .action-button:hover {{
+            background: #374151;
+        }}
+
         @media (max-width: 900px) {{
             .benchmark-grid {{
                 grid-template-columns: 1fr;
@@ -2189,6 +2554,41 @@ def create_html_report(portfolio_input, portfolio_df, watchlist_df, ai_summary, 
                 <div>
                     {benchmark_table_html}
                 </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>Sector Allocation</h2>
+            <p class="section-intro">{escape(sector_note)}</p>
+            {sector_cards_html}
+            <div class="benchmark-grid">
+                <div>
+                    {sector_chart}
+                </div>
+                <div>
+                    {sector_table_html}
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>Dividends</h2>
+            <p class="section-intro">Estimates annual dividend income from your current holdings when dividend yield data is available.</p>
+            {dividend_table_html}
+        </div>
+
+        <div class="section">
+            <h2>Earnings Dates</h2>
+            <p class="section-intro">Tracks upcoming earnings dates for portfolio and watchlist stocks when yfinance provides the data.</p>
+            {earnings_table_html}
+        </div>
+
+        <div class="section">
+            <h2>Report Actions</h2>
+            <p class="section-intro">Use this when you want to save or share the report.</p>
+            <div class="action-buttons">
+                <button class="action-button" onclick="window.print()">Print or Save as PDF</button>
+                <button class="action-button" onclick="window.location.href='mailto:?subject=AI Financial Dashboard Report&body=Open the latest dashboard report saved on this computer.'">Open Email Draft</button>
             </div>
         </div>
 
@@ -2303,6 +2703,11 @@ def main():
     benchmark_chart = create_benchmark_chart(portfolio_series, spy_series, qqq_series)
     print("Benchmark comparison created.")
 
+    print("Building sector allocation...")
+    sector_df = build_sector_allocation(portfolio_df)
+    sector_note = get_sector_concentration_note(sector_df)
+    print("Sector allocation created.")
+
     portfolio_tickers = portfolio_df["Ticker"].tolist()
     watchlist_tickers = watchlist_df["Ticker"].tolist() if not watchlist_df.empty else []
 
@@ -2320,7 +2725,8 @@ def main():
         portfolio_news,
         watchlist_news,
         benchmark_df,
-        benchmark_verdict
+        benchmark_verdict,
+        sector_note
     )
     print("AI summary created.")
 
@@ -2333,7 +2739,9 @@ def main():
         watchlist_news,
         benchmark_df,
         benchmark_verdict,
-        benchmark_chart
+        benchmark_chart,
+        sector_df,
+        sector_note
     )
 
     print(f"Report saved to: {report_path}")
@@ -2342,7 +2750,7 @@ def main():
 
     send_mac_notification(
         "AI Financial Dashboard",
-        "Your dashboard with benchmarks is ready."
+        "Your dashboard with final features is ready."
     )
 
 
